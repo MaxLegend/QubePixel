@@ -24,6 +24,8 @@ use crate::core::gameobjects::world::{WorldWorker, WorldResult};
 use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use crate::screens::settings::SettingsScreen;
+use crate::core::gameobjects::texture_atlas::TextureAtlas;
+use crate::core::raycast::RaycastResult;
 
 pub struct GameScreen {
     // -- 3D ------------------------------------------------------------------
@@ -31,6 +33,8 @@ pub struct GameScreen {
     pipeline_3d: Option<Game3DPipeline>,
     /// Background thread that owns `World` and does chunk gen + mesh building.
     world_worker: WorldWorker,
+    /// Texture atlas — loads PNGs, stitches into one GPU texture.
+    atlas: TextureAtlas,
     /// Completed world work waiting to be uploaded to GPU.
     pending_world_result: Option<WorldResult>,
     /// Profiling: last GPU upload time in microseconds.
@@ -57,6 +61,10 @@ pub struct GameScreen {
     #[allow(dead_code)]
     mouse_down:    bool,
     keys:          std::collections::HashSet<PhysicalKey>,
+    /// Block the camera is currently aiming at (raycast result).
+    /// `None` when camera is unlocked or no block in range.
+
+    target_block: Option<RaycastResult>,
 
     // -- Transition ----------------------------------------------------------
     pending_action: ScreenAction,
@@ -73,12 +81,16 @@ impl GameScreen {
             "Back to Menu",
         );
 
+        let atlas = TextureAtlas::load();
+        let atlas_layout = atlas.layout().clone();
+
         Self {
             camera:      Camera::new(840, 480),
             pipeline_3d: None,
-            world_worker: WorldWorker::new(),
+            world_worker: WorldWorker::new(atlas_layout),
             pending_world_result: None,
             last_upload_us: 0,
+            atlas,
 
             ui:      None,
             font:    None,
@@ -93,7 +105,7 @@ impl GameScreen {
             camera_locked: false, // J to activate
             mouse_down:    false,
             keys:          std::collections::HashSet::new(),
-
+            target_block: None,
             pending_action: ScreenAction::None,
         }
     }
@@ -150,10 +162,16 @@ impl Screen for GameScreen {
         self.process_input(dt);
 
         // ★ Request background world update (no-op if previous is still running)
-        self.world_worker.request_update(self.camera.position);
+        let ray_dir = if self.camera_locked {
+            Some(self.camera.forward())
+        } else {
+            None
+        };
+        self.world_worker.request_update(self.camera.position, ray_dir);
 
         // ★ Non-blocking poll — if the worker finished, stash the result
         if let Some(result) = self.world_worker.try_recv_result() {
+            self.target_block = result.raycast_result;
             self.pending_world_result = Some(result);
         }
 
@@ -185,6 +203,8 @@ impl Screen for GameScreen {
             self.font = Some(BitmapFont::new(device, format));
             debug_log!("GameScreen", "render", "BitmapFont initialised lazily");
         }
+        // Upload texture atlas to GPU (lazy, once)
+        self.atlas.ensure_gpu(device, queue);
 
         // ★ Upload GPU meshes when background worker delivers results
         if let Some(result) = self.pending_world_result.take() {
@@ -215,8 +235,18 @@ impl Screen for GameScreen {
         self.camera.update_aspect(width, height);
 
         // 3D pass
-        let render_us = pipeline.render(encoder, view, device, queue, &self.camera, width, height);
-
+        // 3D pass
+        let atlas_view = self.atlas.texture_view().unwrap();
+        let render_us = pipeline.render(
+            encoder, view, device, queue, &self.camera,
+            width, height, atlas_view,
+        );
+        // Outline pass — black wireframe around the targeted block
+        let target_pos = self.target_block.map(|r| r.block_pos);
+        pipeline.render_outline(
+            encoder, view, device, queue, &self.camera,
+            width, height, target_pos,
+        );
         flow_debug_log!(
             "GameScreen", "render",
             "[PERF] frame: upload={:.2}ms render={:.2}ms chunks={}",

@@ -11,8 +11,8 @@
   "emit_light": 0,
 
   "faces": {
-    "top":    { "color": [0.22, 0.52, 0.14] },
-    "bottom": { "color": [0.40, 0.26, 0.10] },
-    "sides":  { "color": [0.30, 0.40, 0.15] }
+    "top":    { "color": [1.0, 1.0, 1.0], "texture": "grass_top" },
+    "bottom": { "color": [1.0, 1.0, 1.0], "texture": "grass_bottom" },
+    "sides":  { "color": [1.0, 1.0, 1.0], "texture": "grass_side" }
   }
 }

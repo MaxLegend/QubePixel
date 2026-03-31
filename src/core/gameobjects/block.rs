@@ -34,6 +34,10 @@ pub struct FaceOverride {
     /// RGB colour (0..1). If absent, falls back to block's base `color`.
     #[serde(default)]
     pub color: [f32; 3],
+    /// Name of the texture in the atlas (e.g. "grass_top", "dirt", "stone_side").
+    /// If absent, this face uses vertex colour only (white tile in atlas).
+    #[serde(default)]
+    pub texture: Option<String>,
 }
 /// Optional per-face colour overrides.
 /// If a face entry is missing, the block's base `color` is used.
@@ -64,6 +68,11 @@ pub struct BlockDefinition {
     /// Base RGB colour (0..1). Used when face-specific colours are absent.
     pub color: [f32; 3],
 
+    /// Name of the texture in the atlas (e.g. "grass_top", "dirt", "stone_side").
+    /// If absent, this face uses vertex colour only (white tile in atlas).
+    #[serde(default)]
+    pub texture: Option<String>,
+
     /// Whether the block blocks movement and is meshed with solid faces.
     #[serde(default = "default_true")]
     pub solid: bool,
@@ -93,6 +102,19 @@ impl BlockDefinition {
             2 => self.faces.top.as_ref().map(|f| f.color).unwrap_or(self.color),
             3 => self.faces.bottom.as_ref().map(|f| f.color).unwrap_or(self.color),
             _ => self.faces.sides.as_ref().map(|f| f.color).unwrap_or(self.color),
+        }
+    }
+
+    /// Return the atlas texture name for a given face direction.
+    /// Returns `None` if this face has no texture (falls back to white tile).
+    ///
+    /// `face`: 0 = +X, 1 = -X, 2 = +Y (top), 3 = -Y (bottom),
+    ///         4 = +Z, 5 = -Z.
+    pub fn texture_for_face(&self, face: u8) -> Option<&str> {
+        match face {
+            2 => self.faces.top.as_ref().and_then(|f| f.texture.as_deref()),
+            3 => self.faces.bottom.as_ref().and_then(|f| f.texture.as_deref()),
+            _ => self.faces.sides.as_ref().and_then(|f| f.texture.as_deref()),
         }
     }
 }

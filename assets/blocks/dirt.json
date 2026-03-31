@@ -11,8 +11,8 @@
   "emit_light": 0,
 
   "faces": {
-    "top":    { "color": [0.40, 0.26, 0.10] },
-    "bottom": { "color": [0.40, 0.26, 0.10] },
-    "sides":  { "color": [0.40, 0.26, 0.10] }
+    "top":    { "color": [1.0, 1.0, 1.0], "texture": "dirt" },
+    "bottom": { "color": [1.0, 1.0, 1.0], "texture": "dirt" },
+    "sides":  { "color": [1.0, 1.0, 1.0], "texture": "dirt" }
   }
 }

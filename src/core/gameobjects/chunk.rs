@@ -2,10 +2,10 @@
 // QubePixel — Chunk  (16 × 16 × 16 cubic voxel chunk)
 // =============================================================================
 
-use crate::{debug_log, flow_debug_log};
+use crate::{ flow_debug_log};
 use crate::core::gameobjects::block::BlockRegistry;
 use crate::screens::game_3d_pipeline::Vertex3D;
-
+use crate::core::gameobjects::texture_atlas::TextureAtlasLayout;
 pub const CHUNK_SIZE: usize = 16;
 
 pub struct Chunk {
@@ -62,7 +62,11 @@ impl Chunk {
     ///
     /// Uses per-face colours from `BlockDefinition::color_for_face()` so
     /// blocks like grass can have green tops and brown sides.
-    pub fn build_mesh(&self, registry: &BlockRegistry) -> (Vec<Vertex3D>, Vec<u32>) {
+    pub fn build_mesh(
+        &self,
+        registry: &BlockRegistry,
+        atlas: &TextureAtlasLayout,
+    ) -> (Vec<Vertex3D>, Vec<u32>) {
         if self.is_all_air() {
             return (Vec::new(), Vec::new());
         }
@@ -93,32 +97,56 @@ impl Chunk {
                     // +X face (dir = 0)
                     if bx + 1 >= CHUNK_SIZE || self.blocks[bx+1][by][bz] == 0 {
                         let c = def.color_for_face(0);
-                        emit_face(&mut vertices, &mut indices, ox, oy, oz, 0, c);
+                        let uv = atlas.uv_for(
+                            def.texture_for_face(0).unwrap_or("")
+                        );
+                        emit_face(&mut vertices, &mut indices,
+                                  ox, oy, oz, 0, c, uv);
                     }
                     // -X face (dir = 1)
                     if bx == 0 || self.blocks[bx-1][by][bz] == 0 {
                         let c = def.color_for_face(1);
-                        emit_face(&mut vertices, &mut indices, ox, oy, oz, 1, c);
+                        let uv = atlas.uv_for(
+                            def.texture_for_face(1).unwrap_or("")
+                        );
+                        emit_face(&mut vertices, &mut indices,
+                                  ox, oy, oz, 1, c, uv);
                     }
                     // +Y face / top (dir = 2)
                     if by + 1 >= CHUNK_SIZE || self.blocks[bx][by+1][bz] == 0 {
                         let c = def.color_for_face(2);
-                        emit_face(&mut vertices, &mut indices, ox, oy, oz, 2, c);
+                        let uv = atlas.uv_for(
+                            def.texture_for_face(2).unwrap_or("")
+                        );
+                        emit_face(&mut vertices, &mut indices,
+                                  ox, oy, oz, 2, c, uv);
                     }
                     // -Y face / bottom (dir = 3)
                     if by == 0 || self.blocks[bx][by-1][bz] == 0 {
                         let c = def.color_for_face(3);
-                        emit_face(&mut vertices, &mut indices, ox, oy, oz, 3, c);
+                        let uv = atlas.uv_for(
+                            def.texture_for_face(3).unwrap_or("")
+                        );
+                        emit_face(&mut vertices, &mut indices,
+                                  ox, oy, oz, 3, c, uv);
                     }
                     // +Z face (dir = 4)
                     if bz + 1 >= CHUNK_SIZE || self.blocks[bx][by][bz+1] == 0 {
                         let c = def.color_for_face(4);
-                        emit_face(&mut vertices, &mut indices, ox, oy, oz, 4, c);
+                        let uv = atlas.uv_for(
+                            def.texture_for_face(4).unwrap_or("")
+                        );
+                        emit_face(&mut vertices, &mut indices,
+                                  ox, oy, oz, 4, c, uv);
                     }
                     // -Z face (dir = 5)
                     if bz == 0 || self.blocks[bx][by][bz-1] == 0 {
                         let c = def.color_for_face(5);
-                        emit_face(&mut vertices, &mut indices, ox, oy, oz, 5, c);
+                        let uv = atlas.uv_for(
+                            def.texture_for_face(5).unwrap_or("")
+                        );
+                        emit_face(&mut vertices, &mut indices,
+                                  ox, oy, oz, 5, c, uv);
                     }
                 }
             }
@@ -152,6 +180,7 @@ fn emit_face(
     ox: f32, oy: f32, oz: f32,
     dir:   u8,
     color: [f32; 3],
+    uv:    (f32, f32, f32, f32),   // (u0, v0, u1, v1)
 ) {
     let base = verts.len() as u32;
 
@@ -170,16 +199,14 @@ fn emit_face(
             [ox, oy+1.0, oz+1.0],
             [ox, oy+1.0, oz    ],
         ]),
-        // +Y (top) — CCW from above: front-left → front-right → back-right → back-left
-        // edge1=(1,0,0), edge2=(1,0,-1) → cross=(0,+1,0) ✓
+        // +Y (top)
         2 => ([0.0, 1.0, 0.0], [
             [ox,     oy+1.0, oz+1.0],
             [ox+1.0, oy+1.0, oz+1.0],
             [ox+1.0, oy+1.0, oz    ],
             [ox,     oy+1.0, oz    ],
         ]),
-        // -Y (bottom) — CCW from below: back-left → back-right → front-right → front-left
-        // edge1=(1,0,0), edge2=(1,0,+1) → cross=(0,-1,0) ✓
+        // -Y (bottom)
         3 => ([0.0, -1.0, 0.0], [
             [ox,     oy, oz    ],
             [ox+1.0, oy, oz    ],
@@ -202,8 +229,34 @@ fn emit_face(
         ]),
     };
 
-    for &corner in &corners {
-        verts.push(Vertex3D { position: corner, normal, color });
+    // UV corners: (u0,v0)=top-left, (u1,v1)=bottom-right
+    // Для каждой грани углы配对 с UV так, чтобы текстура не была зеркальной
+    let (u0, v0, u1, v1) = uv;
+    let uvs: [[f32; 2]; 4] = match dir {
+        2 => [ // +Y: смотрим сверху
+            [u0, v1], [u1, v1], [u1, v0], [u0, v0],
+        ],
+        3 => [ // -Y: смотрим снизу
+            [u0, v0], [u1, v0], [u1, v1], [u0, v1],
+        ],
+        1 => [ // -X
+            [u0, v1], [u1, v1], [u1, v0], [u0, v0],
+        ],
+        4 => [ // +Z
+            [u1, v1], [u0, v1], [u0, v0], [u1, v0],
+        ],
+        _ => [ // +X (0), -Z (5), fallback
+            [u0, v0], [u1, v0], [u1, v1], [u0, v1],
+        ],
+    };
+
+    for i in 0..4 {
+        verts.push(Vertex3D {
+            position: corners[i],
+            normal,
+            color,
+            texcoord: uvs[i],
+        });
     }
     idxs.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
 }

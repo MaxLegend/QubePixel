@@ -11,8 +11,8 @@
   "emit_light": 0,
 
   "faces": {
-    "top":    { "color": [0.50, 0.50, 0.50] },
-    "bottom": { "color": [0.50, 0.50, 0.50] },
-    "sides":  { "color": [0.48, 0.48, 0.48] }
+    "top":    { "color": [1.0, 1.0, 1.0], "texture": "stone" },
+    "bottom": { "color": [1.0, 1.0, 1.0], "texture": "stone" },
+    "sides":  { "color": [1.0, 1.0, 1.0], "texture": "stone" }
   }
 }

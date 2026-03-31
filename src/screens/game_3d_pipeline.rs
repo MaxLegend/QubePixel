@@ -161,33 +161,39 @@ impl Camera {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex3D {
-    pub position: [f32; 3],
-    pub normal:   [f32; 3],
-    pub color:    [f32; 3],
+    pub position: [f32; 3],  // 12 B  @ offset  0
+    pub normal:   [f32; 3],  // 12 B  @ offset 12
+    pub color:    [f32; 3],  // 12 B  @ offset 24
+    pub texcoord: [f32; 2],  //  8 B  @ offset 36
 }
+// Total: 44 bytes per vertex
 
 // ---------------------------------------------------------------------------
 // WGSL shaders
 // ---------------------------------------------------------------------------
 const SHADER_SOURCE: &str = r"
 struct Uniforms {
-    view_proj:  mat4x4<f32>,   // 64 B  @ offset  0
-    light_dir:  vec4<f32>,     // 16 B  @ offset 64  (xyz=dir, w=intensity)
-    camera_pos: vec4<f32>,     // 16 B  @ offset 80  (xyz=pos, w unused)
+    view_proj:  mat4x4<f32>,
+    light_dir:  vec4<f32>,
+    camera_pos: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var atlas_tex:    texture_2d<f32>;
+@group(0) @binding(2) var atlas_sampler: sampler;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
     @location(2) color:    vec3<f32>,
+    @location(3) texcoord: vec2<f32>,
 };
 struct VertexOutput {
     @builtin(position) clip_pos:    vec4<f32>,
     @location(0)       v_normal:    vec3<f32>,
     @location(1)       v_color:     vec3<f32>,
     @location(2)       v_world_pos: vec3<f32>,
+    @location(3)       v_texcoord:  vec2<f32>,
 };
 
 @vertex
@@ -197,28 +203,51 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.v_normal    = input.normal;
     out.v_color     = input.color;
     out.v_world_pos = input.position;
+    out.v_texcoord  = input.texcoord;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let tex_color  = textureSample(atlas_tex, atlas_sampler, input.v_texcoord).rgb;
+    let base_color = input.v_color * tex_color;
+
     let light_dir = normalize(u.light_dir.xyz);
     let ambient   = 0.35;
     let diffuse   = max(dot(normalize(input.v_normal), light_dir), 0.0);
     let light     = ambient + diffuse * 0.65 * u.light_dir.w;
-    let lit_color = input.v_color * light;
+    let lit_color = base_color * light;
 
-    // Fog disabled — TODO: re-enable when terrain inspection is done.
-    // let dist       = length(input.v_world_pos - u.camera_pos.xyz);
-    // let fog_start  = 32.0;
-    // let fog_end    = 56.0;
-    // let fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    // let fog_color  = vec3<f32>(0.55, 0.65, 0.85);
-    // return vec4<f32>(mix(lit_color, fog_color, fog_factor), 1.0);
-
+    // Fog disabled — TODO: re-enable with proper distance
     return vec4<f32>(lit_color, 1.0);
 }
 ";
+
+// ---------------------------------------------------------------------------
+// WGSL outline shader — renders black wireframe cube for block highlight
+// ---------------------------------------------------------------------------
+const OUTLINE_SHADER_SOURCE: &str = r"
+struct OutlineUniforms {
+    view_proj: mat4x4<f32>,
+    block_pos: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: OutlineUniforms;
+
+@vertex
+fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    let world_pos = position + u.block_pos.xyz;
+    return u.view_proj * vec4<f32>(world_pos, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+";
+
+/// Uniform size: mat4x4<f32> (64 B) + vec4<f32> (16 B) = 80 B.
+const OUTLINE_UNIFORM_SIZE: u64 = 80;
 
 // ---------------------------------------------------------------------------
 // ChunkMesh — GPU buffers + AABB for one chunk draw call
@@ -248,6 +277,16 @@ pub struct Game3DPipeline {
     vram_usage:        u64,
     /// Chunks culled last frame (for debug overlay).
     pub culled_last_frame: u32,
+    /// Nearest sampler for the texture atlas.
+    atlas_sampler: Option<wgpu::Sampler>,
+    // -- Outline (block highlight) ----------------------------------------
+    outline_pipeline:        Option<wgpu::RenderPipeline>,
+    outline_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    outline_bind_group:      Option<wgpu::BindGroup>,
+    outline_uniform_buffer:  Option<wgpu::Buffer>,
+    outline_vb:              Option<wgpu::Buffer>,
+    /// Surface format cached at creation time — needed for lazy outline init.
+    surface_format:          wgpu::TextureFormat,
 }
 
 const UNIFORM_SIZE: u64 = 96; // 24 × f32
@@ -268,16 +307,37 @@ impl Game3DPipeline {
         let bind_group_layout = device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
                 label:   Some("Game3D BGL"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding:    0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty:                 wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size:   std::num::NonZeroU64::new(UNIFORM_SIZE),
+                entries: &[
+                    // binding 0 — uniform buffer
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size:   std::num::NonZeroU64::new(UNIFORM_SIZE),
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    // binding 1 — texture atlas
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    // binding 2 — sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
             },
         );
 
@@ -293,9 +353,10 @@ impl Game3DPipeline {
             array_stride: std::mem::size_of::<Vertex3D>() as wgpu::BufferAddress,
             step_mode:    wgpu::VertexStepMode::Vertex,
             attributes:   &wgpu::vertex_attr_array![
-                0 => Float32x3,
-                1 => Float32x3,
-                2 => Float32x3,
+                0 => Float32x3,   // position
+                1 => Float32x3,   // normal
+                2 => Float32x3,   // color
+                3 => Float32x2,   // texcoord
             ],
         };
 
@@ -352,6 +413,13 @@ impl Game3DPipeline {
             chunk_meshes:  HashMap::new(),
             vram_usage:    UNIFORM_SIZE,
             culled_last_frame: 0,
+            atlas_sampler: None,
+            outline_pipeline:        None,
+            outline_bind_group_layout: None,
+            outline_bind_group:      None,
+            outline_uniform_buffer:  None,
+            outline_vb:              None,
+            surface_format:          format,
         }
     }
 
@@ -587,10 +655,24 @@ impl Game3DPipeline {
         camera:     &Camera,
         width:      u32,
         height:     u32,
+        atlas_view: &wgpu::TextureView,
     ) -> u128 {
         let t0 = Instant::now();
         self.ensure_depth(device, width, height);
-
+        // Lazy-init atlas sampler
+        if self.atlas_sampler.is_none() {
+            self.atlas_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
+                label:           Some("Atlas Nearest Sampler"),
+                address_mode_u:  wgpu::AddressMode::ClampToEdge,
+                address_mode_v:  wgpu::AddressMode::ClampToEdge,
+                address_mode_w:  wgpu::AddressMode::ClampToEdge,
+                mag_filter:      wgpu::FilterMode::Nearest,
+                min_filter:      wgpu::FilterMode::Nearest,
+                mipmap_filter:   wgpu::FilterMode::Nearest,
+                ..Default::default()
+            }));
+            debug_log!("Game3DPipeline", "render", "Atlas sampler created");
+        }
         // Build view-projection and extract frustum planes
         let vp = camera.view_projection_matrix();
         let frustum = FrustumPlanes::from_view_projection(&vp);
@@ -613,10 +695,22 @@ impl Game3DPipeline {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label:   Some("Game3D BG"),
             layout:  &self.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding:  0,
-                resource: self.uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding:  0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  1,
+                    resource: wgpu::BindingResource::TextureView(atlas_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding:  2,
+                    resource: wgpu::BindingResource::Sampler(
+                        self.atlas_sampler.as_ref().unwrap()
+                    ),
+                },
+            ],
         });
 
         // Depth clear
@@ -700,5 +794,229 @@ impl Game3DPipeline {
 
     pub fn vram_usage(&self) -> u64 {
         self.vram_usage
+    }
+
+    // -----------------------------------------------------------------------
+    // Outline — block highlight wireframe
+    // -----------------------------------------------------------------------
+
+    /// Lazy-initialise the outline pipeline and static buffers.
+    fn init_outline(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        debug_log!("Game3DPipeline", "init_outline", "Creating outline pipeline");
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label:  Some("Outline Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(OUTLINE_SHADER_SOURCE)),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label:   Some("Outline BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size:   std::num::NonZeroU64::new(OUTLINE_UNIFORM_SIZE),
+                        },
+                        count: None,
+                    },
+                ],
+            },
+        );
+
+        let pipeline_layout = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label:                Some("Outline Pipeline Layout"),
+                bind_group_layouts:   &[&bind_group_layout],
+                push_constant_ranges: &[],
+            },
+        );
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("Outline Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module:      &shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    step_mode:    wgpu::VertexStepMode::Vertex,
+                    attributes:   &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module:      &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format:      self.surface_format,
+                    blend:       None,
+                    write_mask:  wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format:              wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare:       wgpu::CompareFunction::LessEqual,
+                stencil:             wgpu::StencilState::default(),
+                bias:                wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview:   None,
+        });
+
+        // Uniform buffer — view_proj + block_pos
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("Outline Uniform Buffer"),
+            size:               OUTLINE_UNIFORM_SIZE,
+            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Static vertex buffer — unit cube wireframe (12 edges, 24 vertices)
+        const E: f32 = 0.005;
+        let vertices: [[f32; 3]; 24] = [
+            // Bottom face edges
+            [-E, -E, -E], [ 1.0+E, -E, -E],
+            [ 1.0+E, -E, -E], [ 1.0+E, -E,  1.0+E],
+            [ 1.0+E, -E,  1.0+E], [-E, -E,  1.0+E],
+            [-E, -E,  1.0+E], [-E, -E, -E],
+            // Top face edges
+            [-E,  1.0+E, -E], [ 1.0+E,  1.0+E, -E],
+            [ 1.0+E,  1.0+E, -E], [ 1.0+E,  1.0+E,  1.0+E],
+            [ 1.0+E,  1.0+E,  1.0+E], [-E,  1.0+E,  1.0+E],
+            [-E,  1.0+E,  1.0+E], [-E,  1.0+E, -E],
+            // Vertical edges
+            [-E, -E, -E], [-E,  1.0+E, -E],
+            [ 1.0+E, -E, -E], [ 1.0+E,  1.0+E, -E],
+            [ 1.0+E, -E,  1.0+E], [ 1.0+E,  1.0+E,  1.0+E],
+            [-E, -E,  1.0+E], [-E,  1.0+E,  1.0+E],
+        ];
+
+        let vb_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                vertices.as_ptr() as *const u8,
+                vertices.len() * std::mem::size_of::<[f32; 3]>(),
+            )
+        };
+
+        let vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("Outline VB"),
+            size:               vb_bytes.len() as u64,
+            usage:              wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&vb, 0, vb_bytes);
+
+        // Bind group — references the uniform buffer
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("Outline BG"),
+            layout:  &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding:  0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        self.vram_usage += vb_bytes.len() as u64 + OUTLINE_UNIFORM_SIZE;
+
+        self.outline_pipeline        = Some(pipeline);
+        self.outline_bind_group_layout = Some(bind_group_layout);
+        self.outline_bind_group      = Some(bind_group);
+        self.outline_uniform_buffer  = Some(uniform_buffer);
+        self.outline_vb              = Some(vb);
+
+        debug_log!("Game3DPipeline", "init_outline", "Outline pipeline ready");
+    }
+
+    /// Render a black wireframe cube around the targeted block.
+    ///
+    /// Draws in a separate render pass with depth test (LessEqual) and no
+    /// depth write, so the outline respects occlusion by other blocks but
+    /// doesn't modify the depth buffer.
+    pub fn render_outline(
+        &mut self,
+        encoder:    &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        device:     &wgpu::Device,
+        queue:      &wgpu::Queue,
+        camera:     &Camera,
+        width:      u32,
+        height:     u32,
+        block_pos:  Option<glam::IVec3>,
+    ) {
+        let block_pos = match block_pos {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Need a depth buffer to test against
+        if self.depth_view.is_none() {
+            return;
+        }
+
+        // Lazy init
+        if self.outline_pipeline.is_none() {
+            self.init_outline(device, queue);
+        }
+
+        // Ensure depth texture exists for the current size
+        self.ensure_depth(device, width, height);
+
+        // Update uniforms: view_proj + block_pos
+        let vp = camera.view_projection_matrix();
+        let mut data = [0.0f32; 20]; // 80 bytes = mat4x4 (16 f32) + vec4 (4 f32)
+        data[0..16].copy_from_slice(&vp.to_cols_array());
+        data[16] = block_pos.x as f32;
+        data[17] = block_pos.y as f32;
+        data[18] = block_pos.z as f32;
+        // data[19] = 0.0 (unused padding)
+
+        let uniform_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                OUTLINE_UNIFORM_SIZE as usize,
+            )
+        };
+        queue.write_buffer(self.outline_uniform_buffer.as_ref().unwrap(), 0, uniform_bytes);
+
+        // Separate render pass: depth read (LessEqual), no depth write, color LoadOp::Load
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Outline Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view:           color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load:  wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view:        self.depth_view.as_ref().unwrap(),
+                depth_ops:   Some(wgpu::Operations {
+                    load:  wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+
+        pass.set_pipeline(self.outline_pipeline.as_ref().unwrap());
+        pass.set_bind_group(0, self.outline_bind_group.as_ref().unwrap(), &[]);
+        pass.set_vertex_buffer(0, self.outline_vb.as_ref().unwrap().slice(..));
+        pass.draw(0..24, 0..1);
+
+        flow_debug_log!(
+            "Game3DPipeline", "render_outline",
+            "Drawing outline at ({}, {}, {})",
+            block_pos.x, block_pos.y, block_pos.z
+        );
     }
 }

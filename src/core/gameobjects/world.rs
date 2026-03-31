@@ -24,7 +24,8 @@ use crate::core::config;
 use crate::core::gameobjects::block::BlockRegistry;
 use crate::core::gameobjects::chunk::{Chunk, CHUNK_SIZE};
 use crate::screens::game_3d_pipeline::Vertex3D;
-
+use crate::core::gameobjects::texture_atlas::{TextureAtlas, TextureAtlasLayout};
+use crate::core::raycast::{dda_raycast, RaycastResult, MAX_RAYCAST_DISTANCE};
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
@@ -55,10 +56,12 @@ pub struct World {
     grass_id: u8,
     dirt_id:  u8,
     stone_id: u8,
+    /// Cloneable UV layout for the texture atlas (used in background thread).
+    atlas_layout: TextureAtlasLayout,
 }
 
 impl World {
-    pub fn new() -> Self {
+    pub fn new(atlas_layout: TextureAtlasLayout) -> Self {
         let registry = BlockRegistry::load();
 
         let grass_id  = registry.id_for("grass").unwrap_or(1);
@@ -78,6 +81,7 @@ impl World {
             grass_id,
             dirt_id,
             stone_id,
+            atlas_layout,
         }
     }
 
@@ -279,7 +283,7 @@ impl World {
                     return None;
                 }
 
-                let (verts, idxs) = chunk.build_mesh(registry);
+                let (verts, idxs) = chunk.build_mesh(registry, &self.atlas_layout);
                 chunk.mesh_dirty = false;
 
                 if verts.is_empty() {
@@ -315,6 +319,23 @@ impl World {
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
+
+    /// Get the block ID at world coordinates (wx, wy, wz).
+    /// Returns 0 (Air) if the chunk is not loaded.
+    pub fn get_block(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        let cs = CHUNK_SIZE as i32;
+        let cx = wx.div_euclid(cs);
+        let cy = wy.div_euclid(cs);
+        let cz = wz.div_euclid(cs);
+        let lx = wx.rem_euclid(cs) as usize;
+        let ly = wy.rem_euclid(cs) as usize;
+        let lz = wz.rem_euclid(cs) as usize;
+
+        match self.chunks.get(&(cx, cy, cz)) {
+            Some(chunk) => chunk.get(lx, ly, lz),
+            None => 0,
+        }
+    }
 }
 
 // =============================================================================
@@ -323,7 +344,7 @@ impl World {
 
 /// Message sent from main thread to the background world thread.
 enum WorldRequest {
-    Update { camera_pos: Vec3 },
+    Update { camera_pos: Vec3, ray_dir: Option<Vec3> },
     Shutdown,
 }
 
@@ -338,6 +359,8 @@ pub struct WorldResult {
     pub mesh_time_us: u128,
     /// Chunks still pending generation (staggered loading).
     pub pending: usize,
+    /// Raycast result — which block the camera is aiming at (if requested).
+    pub raycast_result: Option<RaycastResult>,
 }
 
 /// Owns a background thread that runs `World::update()` + `World::build_meshes()`
@@ -355,18 +378,18 @@ pub struct WorldWorker {
 }
 
 impl WorldWorker {
-    pub fn new() -> Self {
+    pub fn new(atlas_layout: TextureAtlasLayout) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<WorldRequest>();
         let (result_tx,  result_rx)  = mpsc::channel::<WorldResult>();
 
         let handle = thread::Builder::new()
             .name("world-worker".into())
             .spawn(move || {
-                let mut world = World::new();
+                let mut world = World::new(atlas_layout);
 
                 loop {
                     match request_rx.recv() {
-                        Ok(WorldRequest::Update { camera_pos }) => {
+                        Ok(WorldRequest::Update { camera_pos, ray_dir }) => {
                             let t_total = Instant::now();
 
                             let (changed, evicted, gen_time, pending) =
@@ -381,6 +404,16 @@ impl WorldWorker {
                                 (Vec::new(), 0)
                             };
 
+                            // ★ Raycast — find the block the camera is aiming at.
+                            let raycast_result = ray_dir.and_then(|dir| {
+                                dda_raycast(
+                                    camera_pos,
+                                    dir,
+                                    MAX_RAYCAST_DISTANCE,
+                                    |wx, wy, wz| world.get_block(wx, wy, wz),
+                                )
+                            });
+
                             let total_time_us = t_total.elapsed().as_micros();
                             let _ = result_tx.send(WorldResult {
                                 meshes,
@@ -389,6 +422,7 @@ impl WorldWorker {
                                 gen_time_us: gen_time,
                                 mesh_time_us: mesh_time,
                                 pending,
+                                raycast_result,
                             });
 
                             flow_debug_log!(
@@ -419,9 +453,9 @@ impl WorldWorker {
     }
 
     /// Send a world-update request. No-op if a previous request is still in flight.
-    pub fn request_update(&mut self, camera_pos: Vec3) {
+    pub fn request_update(&mut self, camera_pos: Vec3, ray_dir: Option<Vec3>) {
         if !self.busy {
-            let _ = self.request_tx.send(WorldRequest::Update { camera_pos });
+            let _ = self.request_tx.send(WorldRequest::Update { camera_pos, ray_dir });
             self.busy = true;
         }
     }
