@@ -52,11 +52,11 @@ impl Camera {
         Vec3::new(cy * cp, sp, sy * cp).normalize()
     }
 
-    /// Horizontal right vector (always on the XZ plane) — used for A/D strafing.
+    /// Horizontal right vector (perpendicular to forward in 3D space) — used for A/D strafing.
     pub fn right(&self) -> Vec3 {
-        // 90° to the right of yaw, Y = 0
-        let angle = self.yaw + std::f32::consts::FRAC_PI_2;
-        Vec3::new(angle.sin(), 0.0, angle.cos()).normalize()
+        // Cross product of forward and world up gives true right vector
+        let fwd = self.forward();
+        fwd.cross(Vec3::Y).normalize()
     }
 
     // ---- Movement ----------------------------------------------------------
@@ -67,7 +67,9 @@ impl Camera {
         self.position += self.forward() * amount;
     }
 
-    /// Strafe horizontally (A/D) — always perpendicular to forward on the XZ plane.
+    /// Strafe horizontally (A/D) — perpendicular to forward direction.
+    /// Pressing D moves right relative to where you're looking.
+    /// Pressing A moves left relative to where you're looking.
     pub fn move_right(&mut self, amount: f32) {
         self.position += self.right() * amount;
     }
