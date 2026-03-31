@@ -144,7 +144,7 @@ pub struct BlockRegistry {
 }
 
 /// Default relative path to the block assets directory.
-const BLOCKS_DIR: &str = "assets/blocks";
+const BLOCKS_DIR: &str = "assets/blocks/";
 /// Name of the master registry file inside the blocks directory.
 const REGISTRY_FILE: &str = "block_registry.json";
 
@@ -316,7 +316,7 @@ impl BlockRegistry {
             "Loading embedded default blocks"
         );
 
-        let defaults = include_str!("../../../assets/block_registry.json");
+        let defaults = include_str!("../../../assets/blocks/block_registry.json");
         let registry: BlockRegistryFile = serde_json::from_str(defaults)
             .expect("[BlockRegistry][load_embedded] Failed to parse embedded block_registry.json");
 

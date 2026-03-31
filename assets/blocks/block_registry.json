@@ -4,6 +4,8 @@
   "blocks": [
     "grass",
     "dirt",
-    "stone"
+    "stone",
+    "planks",
+    "diamond_block"
   ]
 }

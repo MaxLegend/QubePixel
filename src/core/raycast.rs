@@ -10,7 +10,7 @@
 // =============================================================================
 
 use glam::{IVec3, Vec3};
-use crate::{debug_log, ext_debug_log};
+use crate::{debug_log, ext_debug_log, flow_debug_log};
 
 /// Maximum distance (in world units) a raycast will travel.
 pub const MAX_RAYCAST_DISTANCE: f32 = 8.0;
@@ -52,6 +52,11 @@ pub fn dda_raycast(
         return None;
     }
     let dir = direction.normalize();
+
+    // Nudge origin slightly along the ray direction to avoid
+    // floating-point edge cases when the origin lies exactly on
+    // a voxel boundary (causes DDA to step into the wrong voxel).
+    let origin = origin + dir * 0.001;
 
     // Current voxel (the one containing the origin).
     let mut ix = origin.x.floor() as i32;
@@ -135,6 +140,6 @@ pub fn dda_raycast(
         }
     }
 
-    debug_log!("Raycast", "dda_raycast", "No block hit within distance");
+    flow_debug_log!("Raycast", "dda_raycast", "No block hit within distance");
     None
 }

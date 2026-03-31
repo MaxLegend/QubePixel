@@ -246,7 +246,7 @@ impl World {
         }
 
         if changed {
-            debug_log!(
+            flow_debug_log!(
                 "World", "update",
                 "[PERF] gen={:.2}ms chunks={}/{} loaded={} evicted={} pending={}",
                 gen_time_us as f64 / 1000.0,
@@ -336,6 +336,49 @@ impl World {
             None => 0,
         }
     }
+
+    /// Remove the block at world coordinates (set to Air = 0).
+    /// Marks the containing chunk as dirty for mesh rebuild.
+    /// No-op if the chunk is not loaded.
+    pub fn remove_block(&mut self, wx: i32, wy: i32, wz: i32) {
+        let cs = CHUNK_SIZE as i32;
+        let cx = wx.div_euclid(cs);
+        let cy = wy.div_euclid(cs);
+        let cz = wz.div_euclid(cs);
+
+        if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
+            let lx = wx.rem_euclid(cs) as usize;
+            let ly = wy.rem_euclid(cs) as usize;
+            let lz = wz.rem_euclid(cs) as usize;
+            chunk.set(lx, ly, lz, 0);
+            debug_log!(
+                "World", "remove_block",
+                "Broke block at ({}, {}, {})", wx, wy, wz
+            );
+        }
+    }
+
+    /// Place a block at world coordinates.
+    /// Marks the containing chunk as dirty for mesh rebuild.
+    /// No-op if the chunk is not loaded or block_id is 0.
+    pub fn place_block(&mut self, wx: i32, wy: i32, wz: i32, block_id: u8) {
+        if block_id == 0 { return; }
+        let cs = CHUNK_SIZE as i32;
+        let cx = wx.div_euclid(cs);
+        let cy = wy.div_euclid(cs);
+        let cz = wz.div_euclid(cs);
+
+        if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
+            let lx = wx.rem_euclid(cs) as usize;
+            let ly = wy.rem_euclid(cs) as usize;
+            let lz = wz.rem_euclid(cs) as usize;
+            chunk.set(lx, ly, lz, block_id);
+            debug_log!(
+                "World", "place_block",
+                "Placed block {} at ({}, {}, {})", block_id, wx, wy, wz
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -344,10 +387,30 @@ impl World {
 
 /// Message sent from main thread to the background world thread.
 enum WorldRequest {
-    Update { camera_pos: Vec3, ray_dir: Option<Vec3> },
+    Update {
+        camera_pos: Vec3,
+        ray_dir: Option<Vec3>,
+        block_ops: Vec<BlockOp>,
+    },
     Shutdown,
 }
+/// Solid block positions for a chunk, sent from the background thread
+/// to the main thread so PhysicsWorld can create compound colliders.
+#[derive(Debug)]
+pub struct ChunkBlockData {
+    pub cx: i32,
+    pub cy: i32,
+    pub cz: i32,
+    /// Local (x, y, z) positions of solid blocks within the chunk.
+    pub solid_positions: Vec<[u8; 3]>,
+}
 
+/// A block modification operation queued by player input.
+#[derive(Debug, Clone)]
+pub enum BlockOp {
+    Break { x: i32, y: i32, z: i32 },
+    Place { x: i32, y: i32, z: i32, block_id: u8 },
+}
 /// Completed work sent back from the background world thread.
 pub struct WorldResult {
     pub meshes: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>,
@@ -361,6 +424,9 @@ pub struct WorldResult {
     pub pending: usize,
     /// Raycast result — which block the camera is aiming at (if requested).
     pub raycast_result: Option<RaycastResult>,
+    /// Solid block data for chunks that were (re)generated — used to
+    /// sync physics colliders on the main thread.
+    pub physics_chunks: Vec<ChunkBlockData>,
 }
 
 /// Owns a background thread that runs `World::update()` + `World::build_meshes()`
@@ -368,13 +434,13 @@ pub struct WorldResult {
 /// mesh building — it only does a non-blocking `try_recv()` and then a cheap
 /// GPU-buffer upload when data is ready.
 pub struct WorldWorker {
-    request_tx: mpsc::Sender<WorldRequest>,
-    result_rx:  mpsc::Receiver<WorldResult>,
-    thread:     Option<thread::JoinHandle<()>>,
-    /// `true` while a request is being processed — avoids queuing up work.
-    busy: bool,
-    /// Latest chunk count reported by the background thread (for debug overlay).
+    request_tx:   mpsc::Sender<WorldRequest>,
+    result_rx:    mpsc::Receiver<WorldResult>,
+    thread:       Option<thread::JoinHandle<()>>,
+    busy:         bool,
     last_chunk_count: usize,
+    /// Операции, накопленные пока worker был занят — отправляются при следующем свободном цикле.
+    pending_ops:  Vec<BlockOp>,
 }
 
 impl WorldWorker {
@@ -389,16 +455,30 @@ impl WorldWorker {
 
                 loop {
                     match request_rx.recv() {
-                        Ok(WorldRequest::Update { camera_pos, ray_dir }) => {
+                        Ok(WorldRequest::Update { camera_pos, ray_dir, block_ops }) => {
                             let t_total = Instant::now();
 
                             let (changed, evicted, gen_time, pending) =
                                 world.update(camera_pos);
 
+                            // ★ Process block operations (break / place)
+                            for op in &block_ops {
+                                match op {
+                                    BlockOp::Break { x, y, z } => {
+                                        world.remove_block(*x, *y, *z);
+                                    }
+                                    BlockOp::Place { x, y, z, block_id } => {
+                                        world.place_block(*x, *y, *z, *block_id);
+                                    }
+                                }
+                            }
+                            let has_block_ops = !block_ops.is_empty();
+
                             // ★ Always build meshes + send result, even if nothing changed.
                             // This ensures `busy` gets cleared so the main thread can
                             // send the next request when the camera moves.
-                            let (meshes, mesh_time) = if changed {
+                            let has_dirty = changed || has_block_ops;
+                            let (meshes, mesh_time) = if has_dirty {
                                 world.build_meshes()
                             } else {
                                 (Vec::new(), 0)
@@ -413,7 +493,33 @@ impl WorldWorker {
                                     |wx, wy, wz| world.get_block(wx, wy, wz),
                                 )
                             });
-
+                            // ★ Extract solid block data for physics collider sync.
+                            // Iterates meshes keys (dirty chunks) and pulls block
+                            // data from world.chunks while the borrow is valid.
+                            let physics_chunks: Vec<ChunkBlockData> = if has_dirty {
+                                meshes.iter()
+                                    .filter_map(|(key, verts, _, _, _)| {
+                                        if verts.is_empty() { return None; }
+                                        let chunk = world.chunks.get(key)?;
+                                        let mut solid = Vec::new();
+                                        for x in 0..CHUNK_SIZE {
+                                            for y in 0..CHUNK_SIZE {
+                                                for z in 0..CHUNK_SIZE {
+                                                    if chunk.get(x, y, z) != 0 {
+                                                        solid.push([x as u8, y as u8, z as u8]);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Some(ChunkBlockData {
+                                            cx: key.0, cy: key.1, cz: key.2,
+                                            solid_positions: solid,
+                                        })
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                             let total_time_us = t_total.elapsed().as_micros();
                             let _ = result_tx.send(WorldResult {
                                 meshes,
@@ -423,6 +529,7 @@ impl WorldWorker {
                                 mesh_time_us: mesh_time,
                                 pending,
                                 raycast_result,
+                                physics_chunks,
                             });
 
                             flow_debug_log!(
@@ -449,13 +556,29 @@ impl WorldWorker {
             thread: Some(handle),
             busy: false,
             last_chunk_count: 0,
+            pending_ops: Vec::new(),
         }
     }
 
     /// Send a world-update request. No-op if a previous request is still in flight.
-    pub fn request_update(&mut self, camera_pos: Vec3, ray_dir: Option<Vec3>) {
+
+    /// `block_ops` are queued break/place operations applied this frame.
+    pub fn request_update(
+        &mut self,
+        camera_pos: Vec3,
+        ray_dir: Option<Vec3>,
+        block_ops: Vec<BlockOp>,
+    ) {
+        // Всегда накапливаем операции, даже если worker занят
+        self.pending_ops.extend(block_ops);
+
         if !self.busy {
-            let _ = self.request_tx.send(WorldRequest::Update { camera_pos, ray_dir });
+            let ops = std::mem::take(&mut self.pending_ops);
+            let _ = self.request_tx.send(WorldRequest::Update {
+                camera_pos,
+                ray_dir,
+                block_ops: ops,
+            });
             self.busy = true;
         }
     }

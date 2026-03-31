@@ -7,3 +7,5 @@ pub(crate) mod renderer;
 pub mod gameobjects;
 pub mod config;
 pub(crate) mod raycast;
+pub(crate) mod physics;
+pub(crate) mod player;

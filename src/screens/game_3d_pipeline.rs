@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::time::Instant;
-use crate::{debug_log, flow_debug_log};
+use crate::{debug_log, ext_debug_log, flow_debug_log};
 use glam::{Mat4, Vec3};
 
 // ---------------------------------------------------------------------------
@@ -495,7 +495,7 @@ impl Game3DPipeline {
         self.vram_usage += new_vram;
 
         let upload_us = t0.elapsed().as_micros();
-        debug_log!(
+        ext_debug_log!(
             "Game3DPipeline", "update_chunk_meshes",
             "[PERF] upload={:.2}ms chunks={} gpu_total={} VRAM={:.2} MB",
             upload_us as f64 / 1000.0,
