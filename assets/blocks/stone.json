@@ -1,0 +1,18 @@
+{
+  "id": "stone",
+  "name": "Stone Block",
+  "description": "A block of stone",
+  "color": [0.50, 0.50, 0.50],
+  "solid": true,
+  "transparent": false,
+  "hardness": 1.5,
+  "blast_resistance": 6.0,
+  "light_emission": 0.0,
+  "friction": 0.6,
+  "slipperiness": 0.6,
+  "requires_tool": true,
+  "stack_size": 64,
+  "textures": {
+    "all": "blocks/stone.png"
+  }
+}

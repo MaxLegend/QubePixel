@@ -1,0 +1,18 @@
+{
+  "id": "dirt",
+  "name": "Dirt Block",
+  "description": "A block of dirt",
+  "color": [0.40, 0.26, 0.10],
+  "solid": true,
+  "transparent": false,
+  "hardness": 0.5,
+  "blast_resistance": 0.5,
+  "light_emission": 0.0,
+  "friction": 0.6,
+  "slipperiness": 0.6,
+  "requires_tool": false,
+  "stack_size": 64,
+  "textures": {
+    "all": "blocks/dirt.png"
+  }
+}
