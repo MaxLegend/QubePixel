@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "description": "QubePixel Block Registry — add a new block by: 1) adding its ID here, 2) creating <id>.json next to this file",
+  "blocks": [
+    "grass",
+    "dirt",
+    "stone"
+  ]
+}

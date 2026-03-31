@@ -1,9 +1,76 @@
 // =============================================================================
 // QubePixel — Game3DPipeline  (camera, depth buffer, world chunk meshes)
 // =============================================================================
+//
+// CHANGELOG vs original:
+//   • chunk_meshes is now HashMap<(i32,i32,i32), ChunkMesh> keyed by chunk coord
+//   • Added update_chunk_meshes() — incrementally add/update dirty chunks only
+//   • Added remove_chunk_meshes() — free GPU buffers for evicted chunks
+//   • set_world_meshes() kept for full-rebuild fallback (initial load)
+//   • render() iterates .values() on HashMap
+//   • vram_usage() properly accounts for incremental changes
+// =============================================================================
 
-use crate::debug_log;
+use std::collections::HashMap;
+use std::time::Instant;
+use crate::{debug_log, flow_debug_log};
 use glam::{Mat4, Vec3};
+
+// ---------------------------------------------------------------------------
+// FrustumPlanes — Gribb/Hartmann frustum extraction for culling
+// ---------------------------------------------------------------------------
+pub struct FrustumPlanes {
+    /// Six planes [a, b, c, d] where ax + by + cz + d >= 0 means inside.
+    planes: [[f32; 4]; 6],
+}
+
+impl FrustumPlanes {
+    /// Extract the six frustum planes from a combined view-projection matrix.
+    pub fn from_view_projection(vp: &Mat4) -> Self {
+        let c = vp.to_cols_array_2d(); // c[col][row], column-major
+
+        // Reconstruct rows: row[i] = [c[0][i], c[1][i], c[2][i], c[3][i]]
+        let row = |i: usize| -> [f32; 4] { [c[0][i], c[1][i], c[2][i], c[3][i]] };
+        let r0 = row(0);
+        let r1 = row(1);
+        let r2 = row(2);
+        let r3 = row(3);
+
+        let add = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
+            [a[0]+b[0], a[1]+b[1], a[2]+b[2], a[3]+b[3]]
+        };
+        let sub = |a: [f32; 4], b: [f32; 4]| -> [f32; 4] {
+            [a[0]-b[0], a[1]-b[1], a[2]-b[2], a[3]-b[3]]
+        };
+
+        Self {
+            planes: [
+                add(r3, r0), // Left
+                sub(r3, r0), // Right
+                add(r3, r1), // Bottom
+                sub(r3, r1), // Top
+                add(r3, r2), // Near
+                sub(r3, r2), // Far
+            ],
+        }
+    }
+
+    /// Returns `true` if the AABB `[min, max]` intersects (or is inside) the frustum.
+    /// Uses the positive vertex test — O(6) plane checks.
+    pub fn intersects_aabb(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        for plane in &self.planes {
+            let [a, b, c, d] = *plane;
+            // Positive vertex: most in the direction of the plane normal
+            let px = if a >= 0.0 { max[0] } else { min[0] };
+            let py = if b >= 0.0 { max[1] } else { min[1] };
+            let pz = if c >= 0.0 { max[2] } else { min[2] };
+            if a * px + b * py + c * pz + d < 0.0 {
+                return false; // Entirely outside this plane
+            }
+        }
+        true
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Camera
@@ -45,42 +112,30 @@ impl Camera {
 
     // ---- Direction vectors -------------------------------------------------
 
-    /// Full look direction including pitch — used for W/S movement.
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         Vec3::new(cy * cp, sp, sy * cp).normalize()
     }
 
-    /// Horizontal right vector (always on the XZ plane) — used for A/D strafing.
     pub fn right(&self) -> Vec3 {
-        // 90° to the right of yaw, Y = 0
-        let angle = self.yaw + std::f32::consts::FRAC_PI_2;
-        Vec3::new(angle.sin(), 0.0, angle.cos()).normalize()
+        self.forward().cross(Vec3::Y).normalize()
     }
 
     // ---- Movement ----------------------------------------------------------
 
-    /// Move along the full local forward vector (includes pitch).
-    /// Pressing W when looking up → actually moves up+forward.
     pub fn move_forward(&mut self, amount: f32) {
         self.position += self.forward() * amount;
     }
 
-    /// Strafe horizontally (A/D) — always perpendicular to forward on the XZ plane.
     pub fn move_right(&mut self, amount: f32) {
         self.position += self.right() * amount;
     }
 
-    /// Move straight up/down along world Y (Space/Shift).
     pub fn move_up(&mut self, amount: f32) {
         self.position.y += amount;
     }
 
-    /// Apply raw mouse delta (pixels).
-    ///
-    /// `dx > 0` → look right (yaw increases).
-    /// `dy > 0` → cursor moved down → look down (pitch decreases).
     pub fn rotate(&mut self, dx: f64, dy: f64) {
         self.yaw  += dx as f32 * self.sensitivity;
         self.pitch = (self.pitch - dy as f32 * self.sensitivity)
@@ -153,24 +208,29 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let light     = ambient + diffuse * 0.65 * u.light_dir.w;
     let lit_color = input.v_color * light;
 
-    let dist       = length(input.v_world_pos - u.camera_pos.xyz);
-    let fog_start  = 32.0;
-    let fog_end    = 56.0;
-    let fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
-    let fog_color  = vec3<f32>(0.55, 0.65, 0.85);
+    // Fog disabled — TODO: re-enable when terrain inspection is done.
+    // let dist       = length(input.v_world_pos - u.camera_pos.xyz);
+    // let fog_start  = 32.0;
+    // let fog_end    = 56.0;
+    // let fog_factor = clamp((dist - fog_start) / (fog_end - fog_start), 0.0, 1.0);
+    // let fog_color  = vec3<f32>(0.55, 0.65, 0.85);
+    // return vec4<f32>(mix(lit_color, fog_color, fog_factor), 1.0);
 
-    return vec4<f32>(mix(lit_color, fog_color, fog_factor), 1.0);
+    return vec4<f32>(lit_color, 1.0);
 }
 ";
 
 // ---------------------------------------------------------------------------
-// ChunkMesh — GPU buffers for one chunk draw call
+// ChunkMesh — GPU buffers + AABB for one chunk draw call
 // ---------------------------------------------------------------------------
 struct ChunkMesh {
     vertex_buffer: wgpu::Buffer,
     index_buffer:  wgpu::Buffer,
     index_count:   u32,
     vram_bytes:    u64,
+    /// World-space AABB used for frustum culling.
+    aabb_min:      [f32; 3],
+    aabb_max:      [f32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -183,8 +243,11 @@ pub struct Game3DPipeline {
     depth_texture:     Option<wgpu::Texture>,
     depth_view:        Option<wgpu::TextureView>,
     depth_size:        (u32, u32),
-    chunk_meshes:      Vec<ChunkMesh>,
+    /// ★ HashMap keyed by chunk coordinate — enables O(1) add/remove
+    chunk_meshes:      HashMap<(i32, i32, i32), ChunkMesh>,
     vram_usage:        u64,
+    /// Chunks culled last frame (for debug overlay).
+    pub culled_last_frame: u32,
 }
 
 const UNIFORM_SIZE: u64 = 96; // 24 × f32
@@ -286,29 +349,140 @@ impl Game3DPipeline {
             depth_texture: None,
             depth_view:    None,
             depth_size:    (0, 0),
-            chunk_meshes:  Vec::new(),
+            chunk_meshes:  HashMap::new(),
             vram_usage:    UNIFORM_SIZE,
+            culled_last_frame: 0,
         }
     }
 
     // -----------------------------------------------------------------------
-    // World mesh upload
+    // ★ INCREMENTAL chunk mesh management
     // -----------------------------------------------------------------------
 
-    /// Replace the GPU chunk mesh set with new CPU-side geometry.
+    /// Incrementally add or update GPU meshes for the given dirty chunks.
+    /// Returns wall-clock microseconds spent on GPU upload (profiling).
+    pub fn update_chunk_meshes(
+        &mut self,
+        device: &wgpu::Device,
+        queue:  &wgpu::Queue,
+        meshes: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>,
+    ) -> u128 {
+        let t0 = Instant::now();
+        let count = meshes.len();
+        let mut new_vram: u64 = 0;
+
+        for (key, vertices, indices, aabb_min, aabb_max) in meshes {
+            // Free old GPU buffers if this chunk was already uploaded
+            if let Some(old) = self.chunk_meshes.remove(&key) {
+                self.vram_usage = self.vram_usage.saturating_sub(old.vram_bytes);
+            }
+
+            // Skip empty chunks (e.g. completely underground/air)
+            if vertices.is_empty() || indices.is_empty() {
+                continue;
+            }
+
+            let vert_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    vertices.as_ptr() as *const u8,
+                    vertices.len() * std::mem::size_of::<Vertex3D>(),
+                )
+            };
+            let idx_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    indices.as_ptr() as *const u8,
+                    indices.len() * std::mem::size_of::<u32>(),
+                )
+            };
+
+            let vb = device.create_buffer(&wgpu::BufferDescriptor {
+                label:              Some("Chunk VB"),
+                size:               vert_bytes.len() as u64,
+                usage:              wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&vb, 0, vert_bytes);
+
+            let ib = device.create_buffer(&wgpu::BufferDescriptor {
+                label:              Some("Chunk IB"),
+                size:               idx_bytes.len() as u64,
+                usage:              wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&ib, 0, idx_bytes);
+
+            let bytes = vert_bytes.len() as u64 + idx_bytes.len() as u64;
+            new_vram += bytes;
+
+            self.chunk_meshes.insert(key, ChunkMesh {
+                vertex_buffer: vb,
+                index_buffer:  ib,
+                index_count:   indices.len() as u32,
+                vram_bytes:    bytes,
+                aabb_min,
+                aabb_max,
+            });
+        }
+
+        self.vram_usage += new_vram;
+
+        let upload_us = t0.elapsed().as_micros();
+        debug_log!(
+            "Game3DPipeline", "update_chunk_meshes",
+            "[PERF] upload={:.2}ms chunks={} gpu_total={} VRAM={:.2} MB",
+            upload_us as f64 / 1000.0,
+            count,
+            self.chunk_meshes.len(),
+            self.vram_usage as f64 / (1024.0 * 1024.0)
+        );
+
+        upload_us
+    }
+
+    /// Remove GPU buffers for chunks that have been evicted from the world.
+    pub fn remove_chunk_meshes(&mut self, keys: &[(i32, i32, i32)]) {
+        let mut freed_vram: u64 = 0;
+        let mut removed = 0u32;
+
+        for key in keys {
+            if let Some(mesh) = self.chunk_meshes.remove(key) {
+                freed_vram += mesh.vram_bytes;
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            self.vram_usage = self.vram_usage.saturating_sub(freed_vram);
+            debug_log!(
+                "Game3DPipeline", "remove_chunk_meshes",
+                "Freed {} chunk meshes, recovered {:.2} MB VRAM",
+                removed,
+                freed_vram as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-rebuild fallback — kept for potential initial load or debug use
+    // -----------------------------------------------------------------------
+
+    /// Replace the entire GPU chunk mesh set. Clears all existing buffers.
+    /// Prefer `update_chunk_meshes()` + `remove_chunk_meshes()` for
+    /// incremental updates (much cheaper).
+    #[allow(dead_code)]
     pub fn set_world_meshes(
         &mut self,
         device: &wgpu::Device,
         queue:  &wgpu::Queue,
-        meshes: Vec<(Vec<Vertex3D>, Vec<u32>)>,
+        meshes: Vec<(Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>,
     ) {
-        let old_vram: u64 = self.chunk_meshes.iter().map(|m| m.vram_bytes).sum();
+        let old_vram: u64 = self.chunk_meshes.values().map(|m| m.vram_bytes).sum();
         self.vram_usage = self.vram_usage.saturating_sub(old_vram);
         self.chunk_meshes.clear();
 
         let mut new_vram: u64 = 0;
 
-        for (vertices, indices) in meshes {
+        for (vertices, indices, aabb_min, aabb_max) in meshes {
             if vertices.is_empty() || indices.is_empty() { continue; }
 
             let vert_bytes: &[u8] = unsafe {
@@ -343,11 +517,15 @@ impl Game3DPipeline {
             let bytes = vert_bytes.len() as u64 + idx_bytes.len() as u64;
             new_vram += bytes;
 
-            self.chunk_meshes.push(ChunkMesh {
+            // Use (0,0,0) as dummy key for full rebuild — these entries
+            // will be overwritten by proper keys if update_chunk_meshes is used later.
+            self.chunk_meshes.insert((0, 0, 0), ChunkMesh {
                 vertex_buffer: vb,
                 index_buffer:  ib,
                 index_count:   indices.len() as u32,
                 vram_bytes:    bytes,
+                aabb_min,
+                aabb_max,
             });
         }
 
@@ -355,7 +533,7 @@ impl Game3DPipeline {
 
         debug_log!(
             "Game3DPipeline", "set_world_meshes",
-            "Uploaded {} chunk meshes, VRAM={:.2} MB",
+            "Full rebuild — {} chunk meshes, VRAM={:.2} MB",
             self.chunk_meshes.len(),
             self.vram_usage as f64 / (1024.0 * 1024.0)
         );
@@ -397,7 +575,7 @@ impl Game3DPipeline {
     }
 
     // -----------------------------------------------------------------------
-    // Render
+    // Render — with frustum culling
     // -----------------------------------------------------------------------
 
     pub fn render(
@@ -409,11 +587,15 @@ impl Game3DPipeline {
         camera:     &Camera,
         width:      u32,
         height:     u32,
-    ) {
+    ) -> u128 {
+        let t0 = Instant::now();
         self.ensure_depth(device, width, height);
 
-        // Uniforms
+        // Build view-projection and extract frustum planes
         let vp = camera.view_projection_matrix();
+        let frustum = FrustumPlanes::from_view_projection(&vp);
+
+        // Upload uniforms
         let mut data = [0.0f32; 24];
         data[0..16].copy_from_slice(&vp.to_cols_array());
         data[16..20].copy_from_slice(&[0.45, 0.80, 0.55, 1.0]);
@@ -454,38 +636,66 @@ impl Game3DPipeline {
             });
         }
 
-        // Main 3D pass
-        if !self.chunk_meshes.is_empty() {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Game3D Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view:           color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load:  wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view:        self.depth_view.as_ref().unwrap(),
-                    depth_ops:   Some(wgpu::Operations {
-                        load:  wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-
-            for mesh in &self.chunk_meshes {
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        // Count visible / culled
+        let mut visible = 0u32;
+        let mut culled  = 0u32;
+        for mesh in self.chunk_meshes.values() {
+            if frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
+                visible += 1;
+            } else {
+                culled += 1;
             }
         }
+        self.culled_last_frame = culled;
+
+        if visible == 0 {
+            return 0; // Nothing to draw
+        }
+
+        // Main 3D pass — only chunks that pass the frustum test
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Game3D Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view:           color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load:  wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view:        self.depth_view.as_ref().unwrap(),
+                depth_ops:   Some(wgpu::Operations {
+                    load:  wgpu::LoadOp::Load,
+                    store:  wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+
+        for mesh in self.chunk_meshes.values() {
+            // CPU-side frustum cull
+            if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) {
+                continue;
+            }
+            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+
+        let render_us = t0.elapsed().as_micros();
+        flow_debug_log!(
+            "Game3DPipeline", "render",
+            "[PERF] render={:.2}ms visible={} culled={} gpu_chunks={}",
+            render_us as f64 / 1000.0,
+            visible, culled, self.chunk_meshes.len()
+        );
+
+        render_us
     }
 
     pub fn vram_usage(&self) -> u64 {

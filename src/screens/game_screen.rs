@@ -1,26 +1,40 @@
 // =============================================================================
 // QubePixel — GameScreen  (3D world + HUD + debug overlay)
 // =============================================================================
+//
+// CHANGELOG vs original:
+//   • World replaced with WorldWorker — chunk gen + mesh build runs on a
+//     background thread; main thread never blocks on CPU-heavy world work.
+//   • GPU upload is still on the main thread (wgpu requirement) but only for
+//     dirty chunks, and only when data is ready (non-blocking poll).
+//   • fog disabled in fragment shader (temporarily).
+// =============================================================================
 
 use crate::core::screen::{Screen, ScreenAction};
 use crate::debug_log;
 use crate::flow_debug_log;
+use std::time::Instant;
 use crate::screens::bitmap_font::BitmapFont;
 use crate::screens::button::Button;
 use crate::screens::debug_overlay::DebugOverlay;
 use crate::screens::game_3d_pipeline::{Camera, Game3DPipeline};
 use crate::screens::main_menu::MainMenuScreen;
 use crate::screens::ui_renderer::UiRenderer;
-use crate::core::gameobjects::world::World;
+use crate::core::gameobjects::world::{WorldWorker, WorldResult};
 use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
+use crate::screens::settings::SettingsScreen;
 
 pub struct GameScreen {
     // -- 3D ------------------------------------------------------------------
     camera:      Camera,
     pipeline_3d: Option<Game3DPipeline>,
-    world:       World,
-    world_dirty: bool,
+    /// Background thread that owns `World` and does chunk gen + mesh building.
+    world_worker: WorldWorker,
+    /// Completed world work waiting to be uploaded to GPU.
+    pending_world_result: Option<WorldResult>,
+    /// Profiling: last GPU upload time in microseconds.
+    last_upload_us: u128,
 
     // -- 2D ------------------------------------------------------------------
     ui:      Option<UiRenderer>,
@@ -62,8 +76,9 @@ impl GameScreen {
         Self {
             camera:      Camera::new(840, 480),
             pipeline_3d: None,
-            world:       World::new(),
-            world_dirty: true,
+            world_worker: WorldWorker::new(),
+            pending_world_result: None,
+            last_upload_us: 0,
 
             ui:      None,
             font:    None,
@@ -134,13 +149,12 @@ impl Screen for GameScreen {
 
         self.process_input(dt);
 
-        let changed = self.world.update(self.camera.position);
-        if changed {
-            self.world_dirty = true;
-            debug_log!(
-                "GameScreen", "update",
-                "World changed — chunks: {}", self.world.chunk_count()
-            );
+        // ★ Request background world update (no-op if previous is still running)
+        self.world_worker.request_update(self.camera.position);
+
+        // ★ Non-blocking poll — if the worker finished, stash the result
+        if let Some(result) = self.world_worker.try_recv_result() {
+            self.pending_world_result = Some(result);
         }
 
         let vram = self.pipeline_3d.as_ref().map_or(0, |p| p.vram_usage())
@@ -172,12 +186,26 @@ impl Screen for GameScreen {
             debug_log!("GameScreen", "render", "BitmapFont initialised lazily");
         }
 
-        // Upload world meshes when dirty
-        if self.world_dirty {
-            let meshes = self.world.build_meshes();
-            self.pipeline_3d.as_mut().unwrap().set_world_meshes(device, queue, meshes);
-            self.world_dirty = false;
-            debug_log!("GameScreen", "render", "World meshes uploaded");
+        // ★ Upload GPU meshes when background worker delivers results
+        if let Some(result) = self.pending_world_result.take() {
+            let pipeline = self.pipeline_3d.as_mut().unwrap();
+
+            if !result.evicted.is_empty() {
+                pipeline.remove_chunk_meshes(&result.evicted);
+            }
+            if !result.meshes.is_empty() {
+                let upload_us = pipeline.update_chunk_meshes(device, queue, result.meshes);
+                self.last_upload_us = upload_us;
+
+                flow_debug_log!(
+                    "GameScreen", "render",
+                    "[PERF] upload={:.2}ms worker_gen={:.2}ms worker_mesh={:.2}ms pending={}",
+                    upload_us as f64 / 1000.0,
+                    result.gen_time_us as f64 / 1000.0,
+                    result.mesh_time_us as f64 / 1000.0,
+                    result.pending
+                );
+            }
         }
 
         let pipeline = self.pipeline_3d.as_mut().unwrap();
@@ -187,7 +215,15 @@ impl Screen for GameScreen {
         self.camera.update_aspect(width, height);
 
         // 3D pass
-        pipeline.render(encoder, view, device, queue, &self.camera, width, height);
+        let render_us = pipeline.render(encoder, view, device, queue, &self.camera, width, height);
+
+        flow_debug_log!(
+            "GameScreen", "render",
+            "[PERF] frame: upload={:.2}ms render={:.2}ms chunks={}",
+            self.last_upload_us as f64 / 1000.0,
+            render_us as f64 / 1000.0,
+            self.world_worker.chunk_count()
+        );
 
         let w  = width  as f32;
         let h  = height as f32;
@@ -318,11 +354,11 @@ impl Screen for GameScreen {
                                 KeyCode::Escape => {
                                     debug_log!(
                                         "GameScreen", "on_event",
-                                        "Escape — switching to MainMenu"
-                                    );
-                                    self.camera_locked = false;
-                                    self.pending_action = ScreenAction::Switch(
-                                        Box::new(MainMenuScreen::new())
+                                        "Escape — opening Settings"
+                                         );
+                                    self.camera_locked = false;  // отпускаем курсор до выхода
+                                    self.pending_action = ScreenAction::Push(
+                                        Box::new(SettingsScreen::new())
                                     );
                                 }
                                 _ => {}

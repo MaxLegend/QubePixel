@@ -2,7 +2,7 @@
 // QubePixel — Chunk  (16 × 16 × 16 cubic voxel chunk)
 // =============================================================================
 
-use crate::debug_log;
+use crate::{debug_log, flow_debug_log};
 use crate::core::gameobjects::block::BlockRegistry;
 use crate::screens::game_3d_pipeline::Vertex3D;
 
@@ -59,6 +59,9 @@ impl Chunk {
 
     /// Build a visible-face mesh for this chunk.
     /// Returns `(vertices, u32_indices)`. Empty if chunk is all-air.
+    ///
+    /// Uses per-face colours from `BlockDefinition::color_for_face()` so
+    /// blocks like grass can have green tops and brown sides.
     pub fn build_mesh(&self, registry: &BlockRegistry) -> (Vec<Vertex3D>, Vec<u32>) {
         if self.is_all_air() {
             return (Vec::new(), Vec::new());
@@ -86,31 +89,42 @@ impl Chunk {
                     let ox = wx_base + bx as f32;
                     let oy = wy_base + by as f32;
                     let oz = wz_base + bz as f32;
-                    let c  = def.color;
 
+                    // +X face (dir = 0)
                     if bx + 1 >= CHUNK_SIZE || self.blocks[bx+1][by][bz] == 0 {
+                        let c = def.color_for_face(0);
                         emit_face(&mut vertices, &mut indices, ox, oy, oz, 0, c);
                     }
+                    // -X face (dir = 1)
                     if bx == 0 || self.blocks[bx-1][by][bz] == 0 {
+                        let c = def.color_for_face(1);
                         emit_face(&mut vertices, &mut indices, ox, oy, oz, 1, c);
                     }
+                    // +Y face / top (dir = 2)
                     if by + 1 >= CHUNK_SIZE || self.blocks[bx][by+1][bz] == 0 {
+                        let c = def.color_for_face(2);
                         emit_face(&mut vertices, &mut indices, ox, oy, oz, 2, c);
                     }
+                    // -Y face / bottom (dir = 3)
                     if by == 0 || self.blocks[bx][by-1][bz] == 0 {
+                        let c = def.color_for_face(3);
                         emit_face(&mut vertices, &mut indices, ox, oy, oz, 3, c);
                     }
+                    // +Z face (dir = 4)
                     if bz + 1 >= CHUNK_SIZE || self.blocks[bx][by][bz+1] == 0 {
+                        let c = def.color_for_face(4);
                         emit_face(&mut vertices, &mut indices, ox, oy, oz, 4, c);
                     }
+                    // -Z face (dir = 5)
                     if bz == 0 || self.blocks[bx][by][bz-1] == 0 {
+                        let c = def.color_for_face(5);
                         emit_face(&mut vertices, &mut indices, ox, oy, oz, 5, c);
                     }
                 }
             }
         }
 
-        debug_log!(
+        flow_debug_log!(
             "Chunk", "build_mesh",
             "Chunk ({},{},{}) => {} verts, {} indices",
             self.cx, self.cy, self.cz, vertices.len(), indices.len()

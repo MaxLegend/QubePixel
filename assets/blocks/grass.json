@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "id": "grass",
+  "display_name": "Grass Block",
+  "description": "The surface layer of terrain — green on top, brown on sides",
+
+  "color": [0.22, 0.52, 0.14],
+
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+
+  "faces": {
+    "top":    { "color": [0.22, 0.52, 0.14] },
+    "bottom": { "color": [0.40, 0.26, 0.10] },
+    "sides":  { "color": [0.30, 0.40, 0.15] }
+  }
+}
