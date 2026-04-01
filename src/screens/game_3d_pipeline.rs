@@ -87,7 +87,8 @@ impl Camera {
     pub fn update_aspect(&mut self, width: u32, height: u32) {
         if height > 0 { self.aspect = width as f32 / height as f32; }
     }
-
+    pub fn fov(&self) -> f32 { self.fov }
+    pub fn aspect(&self) -> f32 { self.aspect }
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
@@ -441,7 +442,38 @@ impl Game3DPipeline {
         );
         upload_us
     }
+    /// Insert a pre-created chunk mesh into the render map.
+    /// Used by UploadWorker to deliver asynchronously created GPU buffers.
+    /// Replaces any existing mesh for the same key and returns the old
+    /// mesh's VRAM size (already subtracted from self.vram_usage).
+    /// Insert a pre-created chunk mesh into the render map.
+    /// Used by the async upload pipeline to deliver GPU buffers
+    /// that were created on the main thread from packed staging data.
+    pub fn insert_chunk_mesh(
+        &mut self,
+        key:           (i32, i32, i32),
+        vertex_buffer: wgpu::Buffer,
+        index_buffer:  wgpu::Buffer,
+        index_count:   u32,
+        vram_bytes:    u64,
+        aabb_min:      [f32; 3],
+        aabb_max:      [f32; 3],
+    ) {
+        // Remove old mesh if present → track freed VRAM
+        if let Some(old) = self.chunk_meshes.remove(&key) {
+            self.vram_usage = self.vram_usage.saturating_sub(old.vram_bytes);
+        }
 
+        self.vram_usage += vram_bytes;
+        self.chunk_meshes.insert(key, ChunkMesh {
+            vertex_buffer,
+            index_buffer,
+            index_count,
+            vram_bytes,
+            aabb_min,
+            aabb_max,
+        });
+    }
     pub fn remove_chunk_meshes(&mut self, keys: &[(i32, i32, i32)]) {
         let mut freed = 0u64;
         let mut removed = 0u32;
@@ -571,10 +603,10 @@ impl Game3DPipeline {
 
         if self.atlas_sampler.is_none() {
             self.atlas_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
-                label:         Some("Atlas Nearest Sampler"),
+                label:         Some("Atlas Mipmap Sampler"),
                 mag_filter:    wgpu::FilterMode::Nearest,
                 min_filter:    wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }));
             debug_log!("Game3DPipeline", "render", "Atlas sampler created");
@@ -695,7 +727,7 @@ impl Game3DPipeline {
     }
 
     pub fn vram_usage(&self) -> u64 { self.vram_usage }
-
+    pub fn gpu_chunk_count(&self) -> usize { self.chunk_meshes.len() }
     // -----------------------------------------------------------------------
     // Outline pipeline
     // -----------------------------------------------------------------------

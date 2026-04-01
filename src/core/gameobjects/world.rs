@@ -1,15 +1,12 @@
 // =============================================================================
-// QubePixel — World  (chunk streaming + Perlin-noise terrain)
+// QubePixel — World  (chunk streaming + Perlin-noise terrain + LOD)
 // =============================================================================
 //
-// CHANGELOG vs original:
-//   • update() returns (bool, Vec<(i32,i32,i32)>) — changed flag + evicted keys
-//   • build_meshes() skips non-dirty chunks (dirty-tracking)
-//   • build_meshes() runs via rayon par_iter_mut() for parallel mesh building
-//   • generate_chunk_fn() explicitly sets mesh_dirty = true
-//   • Staggered loading: MAX_CHUNKS_PER_FRAME limits generation per update
-//   • WorldWorker: background thread + channels for non-blocking world ops
-//   • Profiling: std::time::Instant on update(), build_meshes(), WorldResult
+// CHANGELOG:
+//   • Cylindrical chunk loading (dx²+dz² ≤ rd²) instead of square
+//   • View-direction priority for chunk generation
+//   • Frustum-prioritized mesh building with per-frame limit
+//   • camera_forward piped through WorldWorker for sorting/culling
 // =============================================================================
 
 use std::collections::HashMap;
@@ -24,15 +21,12 @@ use crate::core::config;
 use crate::core::gameobjects::block::BlockRegistry;
 use crate::core::gameobjects::chunk::{Chunk, CHUNK_SIZE};
 use crate::screens::game_3d_pipeline::Vertex3D;
-use crate::core::gameobjects::texture_atlas::{TextureAtlas, TextureAtlasLayout};
+use crate::core::gameobjects::texture_atlas::TextureAtlasLayout;
 use crate::core::raycast::{dda_raycast, RaycastResult, MAX_RAYCAST_DISTANCE};
+
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
-
-/// Vertical range relative to the camera's current chunk.
-const VERTICAL_BELOW: i32 = 2;
-const VERTICAL_ABOVE: i32 = 3;
 
 /// World-space Y at which the noise maps to zero (the "sea level").
 const SURFACE_BASE: f64 = 8.0;
@@ -41,10 +35,10 @@ const SURFACE_AMP: f64  = 5.0;
 /// Horizontal scale of the noise (larger = smoother hills).
 const NOISE_SCALE: f64  = 48.0;
 
-/// ★ Staggered loading — max chunks generated per World::update() call.
-/// Prevents frame spikes when a large number of chunks need generation.
-/// With the background thread, this limits how long ONE worker iteration takes.
+/// Staggered loading — max chunks generated per World::update() call.
 const MAX_CHUNKS_PER_FRAME: usize = 64;
+/// Max chunk meshes rebuilt per build_meshes() call (frustum-priority order).
+const MAX_MESH_BUILDS_PER_FRAME: usize = 128;
 
 // ---------------------------------------------------------------------------
 // World
@@ -56,14 +50,16 @@ pub struct World {
     grass_id: u8,
     dirt_id:  u8,
     stone_id: u8,
-    /// Cloneable UV layout for the texture atlas (used in background thread).
     atlas_layout: TextureAtlasLayout,
+    /// Per-chunk LOD level (0 = full, 1 = 2×, 2 = 4×).
+    chunk_lod: HashMap<(i32, i32, i32), u8>,
+    /// LOD counts from last update (for profiler).
+    last_lod_counts: [usize; 3],
 }
 
 impl World {
     pub fn new(atlas_layout: TextureAtlasLayout) -> Self {
         let registry = BlockRegistry::load();
-
         let grass_id  = registry.id_for("grass").unwrap_or(1);
         let dirt_id   = registry.id_for("dirt").unwrap_or(grass_id);
         let stone_id  = registry.id_for("stone").unwrap_or(grass_id);
@@ -82,12 +78,10 @@ impl World {
             dirt_id,
             stone_id,
             atlas_layout,
+            chunk_lod: HashMap::new(),
+            last_lod_counts: [0; 3],
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Terrain helpers (pure / no &mut self)
-    // -----------------------------------------------------------------------
 
     fn surface_height_fn(noise: &Perlin, wx: i32, wz: i32) -> i32 {
         let nx = wx as f64 / NOISE_SCALE;
@@ -95,10 +89,6 @@ impl World {
         let h  = noise.get([nx, nz]);
         (SURFACE_BASE + h * SURFACE_AMP).round() as i32
     }
-
-    // -----------------------------------------------------------------------
-    // Chunk generation — static so rayon closures can borrow independently
-    // -----------------------------------------------------------------------
 
     fn generate_chunk_fn(
         noise:    &Perlin,
@@ -118,7 +108,6 @@ impl World {
 
                 for by in 0..CHUNK_SIZE {
                     let wy = cy * CHUNK_SIZE as i32 + by as i32;
-
                     let id = if wy > surface {
                         0
                     } else if wy == surface {
@@ -128,59 +117,72 @@ impl World {
                     } else {
                         stone_id
                     };
-
                     chunk.set_gen(bx, by, bz, id);
                 }
             }
         }
-
         chunk
     }
 
-    // -----------------------------------------------------------------------
-    // Streaming update — rayon parallel generation + staggered loading
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // update — generate/evict chunks, compute LOD levels
+    // -------------------------------------------------------------------
 
     /// Load chunks around `camera_pos` and unload ones too far away.
-    /// Returns `(changed, evicted, gen_time_us, pending)`:
-    ///   - `changed`   — true if the chunk set changed
-    ///   - `evicted`   — list of chunk keys removed (GPU buffers must be freed)
-    ///   - `gen_time`  — wall-clock microseconds for chunk generation (profiling)
-    ///   - `pending`   — how many chunks still need generation (staggered)
+    /// Uses cylindrical shape (dx²+dz² ≤ rd²) and prioritizes view direction.
+    /// Returns `(changed, evicted, gen_time_us, pending)`.
     pub fn update(
         &mut self,
         camera_pos: Vec3,
+        camera_forward: Vec3,
     ) -> (bool, Vec<(i32, i32, i32)>, u128, usize) {
-        let rd = config::render_distance();
+        let rd      = config::render_distance();
+        let v_below = config::vertical_below();
+        let v_above = config::vertical_above();
+        let rd_sq   = rd * rd;
 
         let cam_cx = (camera_pos.x / CHUNK_SIZE as f32).floor() as i32;
         let cam_cy = (camera_pos.y / CHUNK_SIZE as f32).floor() as i32;
         let cam_cz = (camera_pos.z / CHUNK_SIZE as f32).floor() as i32;
 
-        // --- Collect keys that need to be generated ---
+        // --- Camera forward projected onto XZ plane (for priority sorting) ---
+        let fwd_xz_len = (camera_forward.x * camera_forward.x
+            + camera_forward.z * camera_forward.z).sqrt();
+        let fwd_nx = if fwd_xz_len > 1e-6 { camera_forward.x / fwd_xz_len } else { 0.0 };
+        let fwd_nz = if fwd_xz_len > 1e-6 { camera_forward.z / fwd_xz_len } else { 0.0 };
+
+        // --- Collect keys within CYLINDRICAL render distance ---
         let mut to_generate: Vec<(i32, i32, i32)> = Vec::new();
         for dx in -rd..=rd {
             for dz in -rd..=rd {
-                for dy in -VERTICAL_BELOW..=VERTICAL_ABOVE {
+                // Cylindrical filter: skip corners of the square
+                if dx * dx + dz * dz > rd_sq { continue; }
+
+                for dy in -v_below..=v_above {
                     let key = (cam_cx + dx, cam_cy + dy, cam_cz + dz);
-                    if !self.chunks.contains_key(&key) {
-                        to_generate.push(key);
-                    }
+                    if self.chunks.contains_key(&key) { continue; }
+                    to_generate.push(key);
                 }
             }
         }
 
-        // ★ Staggered loading: sort by distance so closest chunks load first
-        to_generate.sort_by_key(|&(cx, cy, cz)| {
-            let dx = (cx - cam_cx) as f64;
-            let dy = (cy - cam_cy) as f64;
-            let dz = (cz - cam_cz) as f64;
-            (dx * dx + dy * dy + dz * dz) as i64
+        // --- Priority sort: view-direction weighted distance ---
+        // Lower score = higher priority.
+        // Chunks in front of camera get a bonus (negative offset).
+        to_generate.sort_by(|a, b| {
+            let score = |key: &(i32, i32, i32)| -> i64 {
+                let dx = (key.0 - cam_cx) as f64;
+                let dy = (key.1 - cam_cy) as f64;
+                let dz = (key.2 - cam_cz) as f64;
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                let dot = dx * fwd_nx as f64 + dz * fwd_nz as f64;
+                // Subtract dot*3 so forward chunks get ~3 chunks distance advantage
+                ((dist_sq - dot * 3.0) * 1000.0) as i64
+            };
+            score(a).cmp(&score(b))
         });
 
         let total_pending = to_generate.len();
-
-        // ★ Limit how many chunks we generate this frame
         let gen_count = to_generate.len().min(MAX_CHUNKS_PER_FRAME);
         let was_truncated = to_generate.len() > MAX_CHUNKS_PER_FRAME;
         to_generate.truncate(gen_count);
@@ -191,7 +193,6 @@ impl World {
         if !to_generate.is_empty() {
             let t0 = Instant::now();
 
-            // --- Parallel generation via rayon ---
             let noise    = &self.noise;
             let grass_id = self.grass_id;
             let dirt_id  = self.dirt_id;
@@ -210,9 +211,8 @@ impl World {
 
             gen_time_us = t0.elapsed().as_micros();
 
-            // Before inserting, mark existing neighbor chunks dirty
-            // so they rebuild with correct cross-chunk boundary culling.
-            for &(key, _) in &new_chunks {
+            // Mark neighbors dirty
+            for &(ref key, _) in &new_chunks {
                 let offsets: [(i32, i32, i32); 6] = [
                     (1, 0, 0), (-1, 0, 0),
                     (0, 1, 0), (0, -1, 0),
@@ -229,86 +229,127 @@ impl World {
             for (key, chunk) in new_chunks {
                 self.chunks.insert(key, chunk);
             }
+
             changed = true;
         }
 
-        // --- Unload far chunks ---
-        let evict_h = rd + 2;
+        // --- Evict chunks beyond CYLINDRICAL render distance ---
+        let evict_r   = rd + 2;
+        let evict_r_sq = evict_r * evict_r;
+        let before = self.chunks.len();
 
-        let evicted: Vec<(i32, i32, i32)> = self.chunks.keys()
-            .filter(|&&(cx, cy, cz)| {
-                let dx = (cx - cam_cx).abs();
-                let dz = (cz - cam_cz).abs();
-                let too_far_h = dx > evict_h || dz > evict_h;
-                let too_far_v = cy < cam_cy - VERTICAL_BELOW - 1
-                    || cy > cam_cy + VERTICAL_ABOVE + 1;
+        let evict_keys: Vec<(i32, i32, i32)> = self.chunks.keys()
+            .copied()
+            .filter(|&(cx, cy, cz)| {
+                let dx = cx - cam_cx;
+                let dz = cz - cam_cz;
+                let too_far_h = dx * dx + dz * dz > evict_r_sq;
+                let too_far_v = cy < cam_cy - v_below - 1
+                    || cy > cam_cy + v_above + 1;
                 too_far_h || too_far_v
             })
-            .copied()
             .collect();
 
-        let before = self.chunks.len();
-        self.chunks.retain(|&(cx, cy, cz), _| {
-            let dx = (cx - cam_cx).abs();
-            let dz = (cz - cam_cz).abs();
-            let too_far_h = dx > evict_h || dz > evict_h;
-            let too_far_v = cy < cam_cy - VERTICAL_BELOW - 1
-                || cy > cam_cy + VERTICAL_ABOVE + 1;
-            !too_far_h && !too_far_v
-        });
+        for key in &evict_keys {
+            self.chunks.remove(key);
+            self.chunk_lod.remove(key);
+        }
+
+        let evicted: Vec<(i32, i32, i32)> = evict_keys;
 
         if self.chunks.len() != before {
             changed = true;
         }
 
-        if changed {
-            flow_debug_log!(
-                "World", "update",
-                "[PERF] gen={:.2}ms chunks={}/{} loaded={} evicted={} pending={}",
-                gen_time_us as f64 / 1000.0,
-                gen_count, total_pending,
-                self.chunks.len(), evicted.len(),
-                if was_truncated { total_pending - gen_count } else { 0 }
-            );
+        // --- Compute LOD levels for all loaded chunks ---
+        let mut lod_counts = [0usize; 3];
+
+        let loaded_keys: Vec<(i32, i32, i32)> = self.chunks.keys().copied().collect();
+
+        for key in loaded_keys {
+            let new_lod = config::compute_lod_level(cam_cx, cam_cz, key.0, key.2);
+            let old_lod = self.chunk_lod.get(&key).copied().unwrap_or(255);
+
+            if new_lod != old_lod {
+                self.chunk_lod.insert(key, new_lod);
+                if old_lod != 255 {
+                    if let Some(chunk) = self.chunks.get_mut(&key) {
+                        chunk.mesh_dirty = true;
+                    }
+                    changed = true;
+                }
+            }
+
+            lod_counts[new_lod as usize] += 1;
         }
+        self.last_lod_counts = lod_counts;
 
         (changed, evicted, gen_time_us, if was_truncated { total_pending - gen_count } else { 0 })
     }
 
-    // -----------------------------------------------------------------------
-    // Mesh build — returns meshes ONLY for dirty chunks (rayon parallel)
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // build_meshes — frustum-prioritized, limited per frame
+    // -------------------------------------------------------------------
 
-    /// Builds GPU-ready mesh data for chunks that are marked `mesh_dirty`.
-    /// Uses cross-chunk neighbor lookup to cull faces on chunk boundaries.
-    /// Returns `(meshes, build_time_us)`.
+    /// Builds meshes for dirty chunks, prioritizing those visible to camera.
+    /// At most `MAX_MESH_BUILDS_PER_FRAME` meshes are built; remaining stay dirty.
     pub fn build_meshes(
         &mut self,
-    ) -> (Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>, u128) {
-        let total = self.chunks.len();
+        camera_pos: Vec3,
+        camera_forward: Vec3,
+    ) -> (Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>, u128, usize) {
         let t0 = Instant::now();
 
-        // ── Phase 1: collect dirty keys & clear flags (mutable access) ──
-        let dirty_keys: Vec<(i32, i32, i32)> = self.chunks.iter()
+        let cam_cx = (camera_pos.x / CHUNK_SIZE as f32).floor() as i32;
+        let cam_cz = (camera_pos.z / CHUNK_SIZE as f32).floor() as i32;
+
+        // Camera forward on XZ plane
+        let fwd_xz = {
+            let len = (camera_forward.x * camera_forward.x
+                + camera_forward.z * camera_forward.z).sqrt();
+            if len > 1e-6 {
+                (camera_forward.x / len, camera_forward.z / len)
+            } else {
+                (0.0f32, 0.0f32)
+            }
+        };
+
+        // Collect all dirty keys
+        let mut dirty_keys: Vec<(i32, i32, i32)> = self.chunks.iter()
             .filter_map(|(&key, chunk)| {
                 if chunk.mesh_dirty { Some(key) } else { None }
             })
             .collect();
 
+        // Sort: visible-first (by dot with forward), then by distance
+        dirty_keys.sort_by(|a, b| {
+            let score = |key: &(i32, i32, i32)| -> i64 {
+                let dx = (key.0 - cam_cx) as f32;
+                let dz = (key.2 - cam_cz) as f32;
+                let dist_sq = dx * dx + dz * dz;
+                let dot = dx * fwd_xz.0 + dz * fwd_xz.1;
+                // Lower score = higher priority; forward chunks get a bonus
+                ((dist_sq - dot * 4.0) * 1000.0) as i64
+            };
+            score(a).cmp(&score(b))
+        });
+
+        // Limit per frame — the rest stay dirty for next frame
+        dirty_keys.truncate(MAX_MESH_BUILDS_PER_FRAME);
+
+        let dirty_count = dirty_keys.len();
+
+        // Clear dirty ONLY for chunks we're about to build
         for &key in &dirty_keys {
             if let Some(chunk) = self.chunks.get_mut(&key) {
                 chunk.mesh_dirty = false;
             }
         }
 
-        let dirty_count = dirty_keys.len();
-
-        // ── Phase 2: parallel mesh build with read-only chunk access ──
-        // Re-borrow self.chunks as immutable so rayon closures can read
-        // neighboring chunks for cross-boundary face culling.
         let chunks   = &self.chunks;
         let registry = &self.registry;
         let atlas    = &self.atlas_layout;
+        let lod_map  = &self.chunk_lod;
         let cs       = CHUNK_SIZE as i32;
 
         let result: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])> = dirty_keys
@@ -319,9 +360,8 @@ impl World {
                     None    => return None,
                 };
 
-                // Neighbor lookup: world coords → block ID.
-                // Returns 0 (Air) when the chunk is not loaded → face is
-                // drawn (conservative).
+                let lod = lod_map.get(&key).copied().unwrap_or(0);
+
                 let get_neighbor = |wx: i32, wy: i32, wz: i32| -> u8 {
                     let cx = wx.div_euclid(cs);
                     let cy = wy.div_euclid(cs);
@@ -333,8 +373,7 @@ impl World {
                         .map_or(0, |c| c.get(lx, ly, lz))
                 };
 
-                let (verts, idxs) = chunk.build_mesh(registry, atlas, get_neighbor);
-
+                let (verts, idxs) = chunk.build_mesh_lod(registry, atlas, get_neighbor, lod);
                 if verts.is_empty() { return None; }
 
                 let s   = CHUNK_SIZE as f32;
@@ -346,28 +385,24 @@ impl World {
 
         let build_time_us = t0.elapsed().as_micros();
 
-        flow_debug_log!(
-            "World", "build_meshes",
-            "[PERF] build={:.2}ms dirty={}/{} total_chunks={}",
-            build_time_us as f64 / 1000.0,
-            result.len(), dirty_count, total
-        );
-
-        (result, build_time_us)
+        (result, build_time_us, dirty_count)
     }
-    // -----------------------------------------------------------------------
-    // Neighbor invalidation
-    // -----------------------------------------------------------------------
 
-    /// Marks a chunk as dirty for mesh rebuild if it exists.
+    // -------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------
+
+    /// Returns true if any loaded chunk still needs its mesh rebuilt.
+    pub fn has_dirty_chunks(&self) -> bool {
+        self.chunks.values().any(|c| c.mesh_dirty)
+    }
+
     fn mark_dirty(&mut self, cx: i32, cy: i32, cz: i32) {
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
             chunk.mesh_dirty = true;
         }
     }
 
-    /// If `lx/ly/lz` is on a chunk boundary, mark the adjacent chunk dirty
-    /// so it rebuilds its mesh with updated cross-chunk face culling.
     fn dirty_boundary_neighbors(
         &mut self,
         cx: i32, cy: i32, cz: i32,
@@ -380,16 +415,10 @@ impl World {
         if lz == 0                 { self.mark_dirty(cx, cy, cz - 1); }
         if lz == CHUNK_SIZE - 1    { self.mark_dirty(cx, cy, cz + 1); }
     }
-    // -----------------------------------------------------------------------
-    // Queries
-    // -----------------------------------------------------------------------
 
-    pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
-    }
+    pub fn chunk_count(&self) -> usize { self.chunks.len() }
+    pub fn lod_counts(&self) -> [usize; 3] { self.last_lod_counts }
 
-    /// Get the block ID at world coordinates (wx, wy, wz).
-    /// Returns 0 (Air) if the chunk is not loaded.
     pub fn get_block(&self, wx: i32, wy: i32, wz: i32) -> u8 {
         let cs = CHUNK_SIZE as i32;
         let cx = wx.div_euclid(cs);
@@ -398,16 +427,12 @@ impl World {
         let lx = wx.rem_euclid(cs) as usize;
         let ly = wy.rem_euclid(cs) as usize;
         let lz = wz.rem_euclid(cs) as usize;
-
         match self.chunks.get(&(cx, cy, cz)) {
             Some(chunk) => chunk.get(lx, ly, lz),
             None => 0,
         }
     }
 
-    /// Remove the block at world coordinates (set to Air = 0).
-    /// Marks the containing chunk as dirty for mesh rebuild.
-    /// No-op if the chunk is not loaded.
     pub fn remove_block(&mut self, wx: i32, wy: i32, wz: i32) {
         let cs = CHUNK_SIZE as i32;
         let cx = wx.div_euclid(cs);
@@ -419,19 +444,11 @@ impl World {
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
             chunk.set(lx, ly, lz, 0);
-            debug_log!(
-                "World", "remove_block",
-                "Broke block at ({}, {}, {})", wx, wy, wz
-            );
+            debug_log!("World", "remove_block", "Broke block at ({}, {}, {})", wx, wy, wz);
         }
-
-        // Rebuild adjacent chunk's mesh if block was on a boundary
         self.dirty_boundary_neighbors(cx, cy, cz, lx, ly, lz);
     }
 
-    /// Place a block at world coordinates.
-    /// Marks the containing chunk as dirty for mesh rebuild.
-    /// No-op if the chunk is not loaded or block_id is 0.
     pub fn place_block(&mut self, wx: i32, wy: i32, wz: i32, block_id: u8) {
         if block_id == 0 { return; }
         let cs = CHUNK_SIZE as i32;
@@ -444,13 +461,8 @@ impl World {
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
             chunk.set(lx, ly, lz, block_id);
-            debug_log!(
-                "World", "place_block",
-                "Placed block {} at ({}, {}, {})", block_id, wx, wy, wz
-            );
+            debug_log!("World", "place_block", "Placed block {} at ({}, {}, {})", block_id, wx, wy, wz);
         }
-
-        // Rebuild adjacent chunk's mesh if block was on a boundary
         self.dirty_boundary_neighbors(cx, cy, cz, lx, ly, lz);
     }
 }
@@ -459,61 +471,51 @@ impl World {
 // WorldWorker — runs World on a background thread
 // =============================================================================
 
-/// Message sent from main thread to the background world thread.
 enum WorldRequest {
     Update {
-        camera_pos: Vec3,
-        ray_dir: Option<Vec3>,
-        block_ops: Vec<BlockOp>,
+        camera_pos:     Vec3,
+        camera_forward: Vec3,
+        ray_dir:        Option<Vec3>,
+        block_ops:      Vec<BlockOp>,
     },
     Shutdown,
 }
-/// Solid block positions for a chunk, sent from the background thread
-/// to the main thread so PhysicsWorld can create compound colliders.
+
 #[derive(Debug)]
 pub struct ChunkBlockData {
     pub cx: i32,
     pub cy: i32,
     pub cz: i32,
-    /// Local (x, y, z) positions of solid blocks within the chunk.
     pub solid_positions: Vec<[u8; 3]>,
 }
 
-/// A block modification operation queued by player input.
 #[derive(Debug, Clone)]
 pub enum BlockOp {
     Break { x: i32, y: i32, z: i32 },
     Place { x: i32, y: i32, z: i32, block_id: u8 },
 }
-/// Completed work sent back from the background world thread.
+
 pub struct WorldResult {
     pub meshes: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>,
     pub evicted: Vec<(i32, i32, i32)>,
     pub chunk_count: usize,
-    /// Wall-clock microseconds for chunk generation (profiling).
     pub gen_time_us: u128,
-    /// Wall-clock microseconds for mesh building (profiling).
     pub mesh_time_us: u128,
-    /// Chunks still pending generation (staggered loading).
     pub pending: usize,
-    /// Raycast result — which block the camera is aiming at (if requested).
     pub raycast_result: Option<RaycastResult>,
-    /// Solid block data for chunks that were (re)generated — used to
-    /// sync physics colliders on the main thread.
     pub physics_chunks: Vec<ChunkBlockData>,
+    // Profiler data
+    pub lod_counts: [usize; 3],
+    pub dirty_count: usize,
+    pub worker_total_us: u128,
 }
 
-/// Owns a background thread that runs `World::update()` + `World::build_meshes()`
-/// asynchronously. The main render thread never blocks on chunk generation or
-/// mesh building — it only does a non-blocking `try_recv()` and then a cheap
-/// GPU-buffer upload when data is ready.
 pub struct WorldWorker {
     request_tx:   mpsc::Sender<WorldRequest>,
     result_rx:    mpsc::Receiver<WorldResult>,
     thread:       Option<thread::JoinHandle<()>>,
     busy:         bool,
     last_chunk_count: usize,
-    /// Операции, накопленные пока worker был занят — отправляются при следующем свободном цикле.
     pending_ops:  Vec<BlockOp>,
 }
 
@@ -529,13 +531,17 @@ impl WorldWorker {
 
                 loop {
                     match request_rx.recv() {
-                        Ok(WorldRequest::Update { camera_pos, ray_dir, block_ops }) => {
+                        Ok(WorldRequest::Update {
+                               camera_pos,
+                               camera_forward,
+                               ray_dir,
+                               block_ops,
+                           }) => {
                             let t_total = Instant::now();
 
                             let (changed, evicted, gen_time, pending) =
-                                world.update(camera_pos);
+                                world.update(camera_pos, camera_forward);
 
-                            // ★ Process block operations (break / place)
                             for op in &block_ops {
                                 match op {
                                     BlockOp::Break { x, y, z } => {
@@ -548,17 +554,17 @@ impl WorldWorker {
                             }
                             let has_block_ops = !block_ops.is_empty();
 
-                            // ★ Always build meshes + send result, even if nothing changed.
-                            // This ensures `busy` gets cleared so the main thread can
-                            // send the next request when the camera moves.
-                            let has_dirty = changed || has_block_ops;
-                            let (meshes, mesh_time) = if has_dirty {
-                                world.build_meshes()
+                            // Also rebuild when deferred dirty chunks remain
+                            let has_dirty = changed
+                                || has_block_ops
+                                || world.has_dirty_chunks();
+
+                            let (meshes, mesh_time, dirty_count) = if has_dirty {
+                                world.build_meshes(camera_pos, camera_forward)
                             } else {
-                                (Vec::new(), 0)
+                                (Vec::new(), 0, 0)
                             };
 
-                            // ★ Raycast — find the block the camera is aiming at.
                             let raycast_result = ray_dir.and_then(|dir| {
                                 dda_raycast(
                                     camera_pos,
@@ -567,9 +573,7 @@ impl WorldWorker {
                                     |wx, wy, wz| world.get_block(wx, wy, wz),
                                 )
                             });
-                            // ★ Extract solid block data for physics collider sync.
-                            // Iterates meshes keys (dirty chunks) and pulls block
-                            // data from world.chunks while the borrow is valid.
+
                             let physics_chunks: Vec<ChunkBlockData> = if has_dirty {
                                 meshes.iter()
                                     .filter_map(|(key, verts, _, _, _)| {
@@ -594,7 +598,10 @@ impl WorldWorker {
                             } else {
                                 Vec::new()
                             };
-                            let total_time_us = t_total.elapsed().as_micros();
+
+                            let worker_total_us = t_total.elapsed().as_micros();
+                            let lod_counts = world.lod_counts();
+
                             let _ = result_tx.send(WorldResult {
                                 meshes,
                                 evicted,
@@ -604,20 +611,14 @@ impl WorldWorker {
                                 pending,
                                 raycast_result,
                                 physics_chunks,
+                                lod_counts,
+                                dirty_count,
+                                worker_total_us,
                             });
-
-                            flow_debug_log!(
-        "WorldWorker", "thread",
-        "[PERF] worker_total={:.2}ms changed={} pending={}",
-        total_time_us as f64 / 1000.0,
-        changed,
-        pending
-    );
                         }
                         Ok(WorldRequest::Shutdown) | Err(_) => break,
                     }
                 }
-
                 debug_log!("WorldWorker", "thread", "Background thread exiting");
             })
             .expect("Failed to spawn world-worker thread");
@@ -634,22 +635,20 @@ impl WorldWorker {
         }
     }
 
-    /// Send a world-update request. No-op if a previous request is still in flight.
-
-    /// `block_ops` are queued break/place operations applied this frame.
     pub fn request_update(
         &mut self,
-        camera_pos: Vec3,
-        ray_dir: Option<Vec3>,
-        block_ops: Vec<BlockOp>,
+        camera_pos:     Vec3,
+        camera_forward: Vec3,
+        ray_dir:        Option<Vec3>,
+        block_ops:      Vec<BlockOp>,
     ) {
-        // Всегда накапливаем операции, даже если worker занят
         self.pending_ops.extend(block_ops);
 
         if !self.busy {
             let ops = std::mem::take(&mut self.pending_ops);
             let _ = self.request_tx.send(WorldRequest::Update {
                 camera_pos,
+                camera_forward,
                 ray_dir,
                 block_ops: ops,
             });
@@ -657,7 +656,6 @@ impl WorldWorker {
         }
     }
 
-    /// Non-blocking poll for a completed result.
     pub fn try_recv_result(&mut self) -> Option<WorldResult> {
         match self.result_rx.try_recv() {
             Ok(result) => {
@@ -673,7 +671,6 @@ impl WorldWorker {
         }
     }
 
-    /// Latest chunk count from the most recent completed world update.
     pub fn chunk_count(&self) -> usize {
         self.last_chunk_count
     }

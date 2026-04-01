@@ -1,10 +1,16 @@
 // =============================================================================
-// QubePixel — TextureAtlas  (loads PNGs, stitches into atlas, lazy GPU upload)
+// QubePixel — TextureAtlas  (loads PNGs, stitches into atlas, mip-mapped GPU upload)
+// =============================================================================
+//
+// CHANGELOG:
+//   • Mip-mapping: generates per-tile mip levels (box filter) to prevent
+//     tile bleeding at atlas seams.  Uses trilinear-ready mip chain.
+//   • mip_level_count() exposed for sampler configuration.
 // =============================================================================
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use image::{imageops, Rgba, RgbaImage};  // removed unused: DynamicImage, ImageFormat
+use image::{imageops, Rgba, RgbaImage};
 use crate::debug_log;
 
 // ---------------------------------------------------------------------------
@@ -17,6 +23,10 @@ pub const ATLAS_WIDTH:  u32 = TILE_SIZE * ATLAS_COLS; // 256
 pub const ATLAS_HEIGHT: u32 = TILE_SIZE * ATLAS_ROWS; // 256
 
 const TEXTURES_DIR: &str = "assets/textures";
+
+/// Number of mip levels: log2(TILE_SIZE) + 1  →  log2(16) + 1 = 5
+/// Levels: 256×256 → 128×128 → 64×64 → 32×32 → 16×16
+pub const MIP_LEVELS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // TextureAtlasLayout
@@ -46,7 +56,10 @@ impl Default for TextureAtlasLayout {
 // TextureAtlas
 // ---------------------------------------------------------------------------
 pub struct TextureAtlas {
+    /// Base atlas image (mip level 0).
     image:       RgbaImage,
+    /// Pre-computed mip levels 1..N (level 0 = self.image).
+    mip_images:  Vec<RgbaImage>,
     layout:      TextureAtlasLayout,
     gpu_texture: Option<wgpu::Texture>,
     gpu_view:    Option<wgpu::TextureView>,
@@ -77,27 +90,35 @@ impl TextureAtlas {
 
     pub fn layout(&self) -> &TextureAtlasLayout { &self.layout }
 
+    /// Upload atlas + mip chain to GPU.
     pub fn ensure_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.gpu_texture.is_some() { return; }
 
         debug_log!(
             "TextureAtlas", "ensure_gpu",
-            "Uploading atlas {}x{} to GPU", ATLAS_WIDTH, ATLAS_HEIGHT
+            "Uploading atlas {}x{} with {} mip levels to GPU",
+            ATLAS_WIDTH, ATLAS_HEIGHT, MIP_LEVELS
         );
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("TextureAtlas"),
-            size:            wgpu::Extent3d { width: ATLAS_WIDTH, height: ATLAS_HEIGHT, depth_or_array_layers: 1 },
-            mip_level_count: 1,
+            size:            wgpu::Extent3d {
+                width: ATLAS_WIDTH,
+                height: ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: MIP_LEVELS,
             sample_count:    1,
             dimension:       wgpu::TextureDimension::D2,
             format:          wgpu::TextureFormat::Rgba8Unorm,
-            usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage:           wgpu::TextureUsages::TEXTURE_BINDING
+                           | wgpu::TextureUsages::COPY_DST,
             view_formats:    &[],
         });
 
-        // wgpu 22: ImageCopyTexture → TexelCopyTextureInfo
-        //          ImageDataLayout  → TexelCopyBufferLayout
+        // Upload mip level 0 (base)
+        let w0 = ATLAS_WIDTH;
+        let h0 = ATLAS_HEIGHT;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture:   &texture,
@@ -108,20 +129,120 @@ impl TextureAtlas {
             &self.image,
             wgpu::TexelCopyBufferLayout {
                 offset:         0,
-                bytes_per_row:  Some(ATLAS_WIDTH * 4),
-                rows_per_image: Some(ATLAS_HEIGHT),
+                bytes_per_row:  Some(w0 * 4),
+                rows_per_image: Some(h0),
             },
-            wgpu::Extent3d { width: ATLAS_WIDTH, height: ATLAS_HEIGHT, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
         );
+
+        // Upload mip levels 1..N
+        for (i, mip) in self.mip_images.iter().enumerate() {
+            let level = (i + 1) as u32;
+            let w = ATLAS_WIDTH >> level;
+            let h = ATLAS_HEIGHT >> level;
+
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture:   &texture,
+                    mip_level: level,
+                    origin:    wgpu::Origin3d::ZERO,
+                    aspect:    wgpu::TextureAspect::All,
+                },
+                mip,
+                wgpu::TexelCopyBufferLayout {
+                    offset:         0,
+                    bytes_per_row:  Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+
+            debug_log!(
+                "TextureAtlas", "ensure_gpu",
+                "Uploaded mip level {} ({}x{})", level, w, h
+            );
+        }
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.gpu_texture = Some(texture);
         self.gpu_view    = Some(view);
 
-        debug_log!("TextureAtlas", "ensure_gpu", "Atlas uploaded to GPU");
+        debug_log!("TextureAtlas", "ensure_gpu", "Atlas uploaded with mip chain");
     }
 
     pub fn texture_view(&self) -> Option<&wgpu::TextureView> { self.gpu_view.as_ref() }
+
+    // -----------------------------------------------------------------------
+    // Mip generation — per-tile box filter (prevents atlas tile bleeding)
+    // -----------------------------------------------------------------------
+
+    /// Generate MIP_LEVELS−1 mip images from the base atlas.
+    /// Each tile is downsampled independently using a 2×2 box filter.
+    fn generate_mip_chain(base: &RgbaImage) -> Vec<RgbaImage> {
+        let mut mips = Vec::with_capacity((MIP_LEVELS - 1) as usize);
+        let mut prev = base.clone();
+        let mut prev_tile_size = TILE_SIZE;
+
+        for level in 1..MIP_LEVELS {
+            let new_tile = prev_tile_size / 2;
+            if new_tile == 0 { break; }
+
+            let new_w = new_tile * ATLAS_COLS;
+            let new_h = new_tile * ATLAS_ROWS;
+            let mut mip = RgbaImage::new(new_w, new_h);
+
+            for row in 0..ATLAS_ROWS {
+                for col in 0..ATLAS_COLS {
+                    // Box-filter downsample this tile independently
+                    for ty in 0..new_tile {
+                        for tx in 0..new_tile {
+                            let sx = col * prev_tile_size + tx * 2;
+                            let sy = row * prev_tile_size + ty * 2;
+
+                            // Average 2×2 block
+                            let mut r = 0u32;
+                            let mut g = 0u32;
+                            let mut b = 0u32;
+                            let mut a = 0u32;
+
+                            for dy in 0..2u32 {
+                                for dx in 0..2u32 {
+                                    let px = (sx + dx).min(prev.width() - 1);
+                                    let py = (sy + dy).min(prev.height() - 1);
+                                    let p = prev.get_pixel(px, py);
+                                    r += p[0] as u32;
+                                    g += p[1] as u32;
+                                    b += p[2] as u32;
+                                    a += p[3] as u32;
+                                }
+                            }
+
+                            let dst_x = col * new_tile + tx;
+                            let dst_y = row * new_tile + ty;
+                            mip.put_pixel(dst_x, dst_y, Rgba([
+                                (r / 4) as u8,
+                                (g / 4) as u8,
+                                (b / 4) as u8,
+                                (a / 4) as u8,
+                            ]));
+                        }
+                    }
+                }
+            }
+
+            debug_log!(
+                "TextureAtlas", "generate_mip_chain",
+                "Mip level {} : {}x{} (tile={}px)",
+                level, new_w, new_h, new_tile
+            );
+
+            prev_tile_size = new_tile;
+            prev = mip.clone();
+            mips.push(mip);
+        }
+
+        mips
+    }
 
     // -----------------------------------------------------------------------
     // Directory loader
@@ -182,7 +303,14 @@ impl TextureAtlas {
             "Total textures loaded: {}", uv_map.len()
         );
 
-        Ok(Self { image: atlas_img, layout: TextureAtlasLayout { uv_map }, gpu_texture: None, gpu_view: None })
+        let mip_images = Self::generate_mip_chain(&atlas_img);
+        Ok(Self {
+            image: atlas_img,
+            mip_images,
+            layout: TextureAtlasLayout { uv_map },
+            gpu_texture: None,
+            gpu_view: None,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -228,7 +356,14 @@ impl TextureAtlas {
 
         debug_log!("TextureAtlas", "build_embedded", "Total procedural textures: {}", uv_map.len());
 
-        Self { image: atlas_img, layout: TextureAtlasLayout { uv_map }, gpu_texture: None, gpu_view: None }
+        let mip_images = Self::generate_mip_chain(&atlas_img);
+        Self {
+            image: atlas_img,
+            mip_images,
+            layout: TextureAtlasLayout { uv_map },
+            gpu_texture: None,
+            gpu_view: None,
+        }
     }
 }
 

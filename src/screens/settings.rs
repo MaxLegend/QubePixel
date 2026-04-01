@@ -54,6 +54,76 @@ impl Screen for SettingsScreen {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+
+                // --- Vertical Below slider ---
+                ui.vertical_centered(|ui| {
+                    ui.set_width(320.0);
+
+                    ui.label(
+                        egui::RichText::new("Chunks Below Camera")
+                            .size(18.0)
+                            .color(egui::Color32::LIGHT_GRAY),
+                    );
+                    ui.add_space(8.0);
+
+                    let mut vb = config::vertical_below() as f32;
+                    let slider = egui::Slider::new(&mut vb, 1.0..=16.0)
+                        .step_by(1.0)
+                        .suffix(" chunks")
+                        .text("Below");
+                    if ui.add(slider).changed() {
+                        config::set_vertical_below(vb as i32);
+                        debug_log!("SettingsScreen", "build_ui",
+                            "Vertical below -> {}", vb as i32);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "How many chunk layers load below the camera. \
+                             Lower = better underground performance."
+                        )
+                            .size(12.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+
+                ui.add_space(20.0);
+
+                // --- Vertical Above slider ---
+                ui.vertical_centered(|ui| {
+                    ui.set_width(320.0);
+
+                    ui.label(
+                        egui::RichText::new("Chunks Above Camera")
+                            .size(18.0)
+                            .color(egui::Color32::LIGHT_GRAY),
+                    );
+                    ui.add_space(8.0);
+
+                    let mut va = config::vertical_above() as f32;
+                    let slider = egui::Slider::new(&mut va, 1.0..=16.0)
+                        .step_by(1.0)
+                        .suffix(" chunks")
+                        .text("Above");
+                    if ui.add(slider).changed() {
+                        config::set_vertical_above(va as i32);
+                        debug_log!("SettingsScreen", "build_ui",
+                            "Vertical above -> {}", va as i32);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "How many chunk layers load above the camera. \
+                             Lower = fewer sky chunks loaded."
+                        )
+                            .size(12.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                });
+
                 ui.add_space(40.0);
 
                 // --- Title ---
