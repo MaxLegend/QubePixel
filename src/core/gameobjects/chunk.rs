@@ -62,18 +62,28 @@ impl Chunk {
     ///
     /// Uses per-face colours from `BlockDefinition::color_for_face()` so
     /// blocks like grass can have green tops and brown sides.
-    pub fn build_mesh(
+    /// Build a visible-face mesh for this chunk.
+    /// Returns `(vertices, u32_indices)`. Empty if chunk is all-air.
+    ///
+    /// `get_neighbor` — closure receiving **world coordinates** and returning
+    /// the block ID at that position. Used to cull faces against blocks in
+    /// adjacent chunks (returns 0 = Air for unloaded chunks → conservative).
+    pub fn build_mesh<F>(
         &self,
         registry: &BlockRegistry,
         atlas: &TextureAtlasLayout,
-    ) -> (Vec<Vertex3D>, Vec<u32>) {
+        get_neighbor: F,
+    ) -> (Vec<Vertex3D>, Vec<u32>)
+    where
+        F: Fn(i32, i32, i32) -> u8,
+    {
         if self.is_all_air() {
             return (Vec::new(), Vec::new());
         }
 
-        let wx_base = (self.cx * CHUNK_SIZE as i32) as f32;
-        let wy_base = (self.cy * CHUNK_SIZE as i32) as f32;
-        let wz_base = (self.cz * CHUNK_SIZE as i32) as f32;
+        let wx_base = self.cx * CHUNK_SIZE as i32;
+        let wy_base = self.cy * CHUNK_SIZE as i32;
+        let wz_base = self.cz * CHUNK_SIZE as i32;
 
         let mut vertices: Vec<Vertex3D> = Vec::with_capacity(1024);
         let mut indices: Vec<u32>       = Vec::with_capacity(1536);
@@ -90,63 +100,109 @@ impl Chunk {
                     };
                     if !def.solid { continue; }
 
-                    let ox = wx_base + bx as f32;
-                    let oy = wy_base + by as f32;
-                    let oz = wz_base + bz as f32;
+                    let ox = wx_base as f32 + bx as f32;
+                    let oy = wy_base as f32 + by as f32;
+                    let oz = wz_base as f32 + bz as f32;
+                    // Integer world coords for neighbor lookup
+                    let wx = wx_base + bx as i32;
+                    let wy = wy_base + by as i32;
+                    let wz = wz_base + bz as i32;
 
                     // +X face (dir = 0)
-                    if bx + 1 >= CHUNK_SIZE || self.blocks[bx+1][by][bz] == 0 {
-                        let c = def.color_for_face(0);
-                        let uv = atlas.uv_for(
-                            def.texture_for_face(0).unwrap_or("")
-                        );
-                        emit_face(&mut vertices, &mut indices,
-                                  ox, oy, oz, 0, c, uv);
+                    {
+                        let n = if bx + 1 < CHUNK_SIZE {
+                            self.blocks[bx + 1][by][bz]
+                        } else {
+                            get_neighbor(wx + 1, wy, wz)
+                        };
+                        if n == 0 {
+                            let c = def.color_for_face(0);
+                            let uv = atlas.uv_for(
+                                def.texture_for_face(0).unwrap_or("")
+                            );
+                            emit_face(&mut vertices, &mut indices,
+                                      ox, oy, oz, 0, c, uv);
+                        }
                     }
                     // -X face (dir = 1)
-                    if bx == 0 || self.blocks[bx-1][by][bz] == 0 {
-                        let c = def.color_for_face(1);
-                        let uv = atlas.uv_for(
-                            def.texture_for_face(1).unwrap_or("")
-                        );
-                        emit_face(&mut vertices, &mut indices,
-                                  ox, oy, oz, 1, c, uv);
+                    {
+                        let n = if bx > 0 {
+                            self.blocks[bx - 1][by][bz]
+                        } else {
+                            get_neighbor(wx - 1, wy, wz)
+                        };
+                        if n == 0 {
+                            let c = def.color_for_face(1);
+                            let uv = atlas.uv_for(
+                                def.texture_for_face(1).unwrap_or("")
+                            );
+                            emit_face(&mut vertices, &mut indices,
+                                      ox, oy, oz, 1, c, uv);
+                        }
                     }
                     // +Y face / top (dir = 2)
-                    if by + 1 >= CHUNK_SIZE || self.blocks[bx][by+1][bz] == 0 {
-                        let c = def.color_for_face(2);
-                        let uv = atlas.uv_for(
-                            def.texture_for_face(2).unwrap_or("")
-                        );
-                        emit_face(&mut vertices, &mut indices,
-                                  ox, oy, oz, 2, c, uv);
+                    {
+                        let n = if by + 1 < CHUNK_SIZE {
+                            self.blocks[bx][by + 1][bz]
+                        } else {
+                            get_neighbor(wx, wy + 1, wz)
+                        };
+                        if n == 0 {
+                            let c = def.color_for_face(2);
+                            let uv = atlas.uv_for(
+                                def.texture_for_face(2).unwrap_or("")
+                            );
+                            emit_face(&mut vertices, &mut indices,
+                                      ox, oy, oz, 2, c, uv);
+                        }
                     }
                     // -Y face / bottom (dir = 3)
-                    if by == 0 || self.blocks[bx][by-1][bz] == 0 {
-                        let c = def.color_for_face(3);
-                        let uv = atlas.uv_for(
-                            def.texture_for_face(3).unwrap_or("")
-                        );
-                        emit_face(&mut vertices, &mut indices,
-                                  ox, oy, oz, 3, c, uv);
+                    {
+                        let n = if by > 0 {
+                            self.blocks[bx][by - 1][bz]
+                        } else {
+                            get_neighbor(wx, wy - 1, wz)
+                        };
+                        if n == 0 {
+                            let c = def.color_for_face(3);
+                            let uv = atlas.uv_for(
+                                def.texture_for_face(3).unwrap_or("")
+                            );
+                            emit_face(&mut vertices, &mut indices,
+                                      ox, oy, oz, 3, c, uv);
+                        }
                     }
                     // +Z face (dir = 4)
-                    if bz + 1 >= CHUNK_SIZE || self.blocks[bx][by][bz+1] == 0 {
-                        let c = def.color_for_face(4);
-                        let uv = atlas.uv_for(
-                            def.texture_for_face(4).unwrap_or("")
-                        );
-                        emit_face(&mut vertices, &mut indices,
-                                  ox, oy, oz, 4, c, uv);
+                    {
+                        let n = if bz + 1 < CHUNK_SIZE {
+                            self.blocks[bx][by][bz + 1]
+                        } else {
+                            get_neighbor(wx, wy, wz + 1)
+                        };
+                        if n == 0 {
+                            let c = def.color_for_face(4);
+                            let uv = atlas.uv_for(
+                                def.texture_for_face(4).unwrap_or("")
+                            );
+                            emit_face(&mut vertices, &mut indices,
+                                      ox, oy, oz, 4, c, uv);
+                        }
                     }
                     // -Z face (dir = 5)
-                    if bz == 0 || self.blocks[bx][by][bz-1] == 0 {
-                        let c = def.color_for_face(5);
-                        let uv = atlas.uv_for(
-                            def.texture_for_face(5).unwrap_or("")
-                        );
-                        emit_face(&mut vertices, &mut indices,
-                                  ox, oy, oz, 5, c, uv);
+                    {
+                        let n = if bz > 0 {
+                            self.blocks[bx][by][bz - 1]
+                        } else {
+                            get_neighbor(wx, wy, wz - 1)
+                        };
+                        if n == 0 {
+                            let c = def.color_for_face(5);
+                            let uv = atlas.uv_for(
+                                def.texture_for_face(5).unwrap_or("")
+                            );
+                            emit_face(&mut vertices, &mut indices,
+                                      ox, oy, oz, 5, c, uv);
+                        }
                     }
                 }
             }

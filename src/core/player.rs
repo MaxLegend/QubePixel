@@ -3,7 +3,7 @@
 // =============================================================================
 
 use glam::Vec3;
-use rapier3d::prelude::RigidBodyHandle;
+use rapier3d::prelude::{RigidBodyHandle, ColliderHandle};
 
 use crate::{debug_log, ext_debug_log, flow_debug_log};
 use crate::core::physics::PhysicsWorld;
@@ -20,13 +20,15 @@ pub const PLAYER_EYE_OFFSET: f32 = 1.62;  // высота глаз над цен
 const PLAYER_JUMP_VEL: f32       = 7.5;
 const PLAYER_SPEED: f32          = 5.0;
 const SPAWN: Vec3 = Vec3::new(8.0, 25.0, 30.0);
-
+const FLY_SPEED: f32 = 12.0;
 // ---------------------------------------------------------------------------
 // PlayerController
 // ---------------------------------------------------------------------------
 pub struct PlayerController {
     body_handle:   RigidBodyHandle,
+    collider_handle: ColliderHandle,
     on_ground:     bool,
+    fly_mode:      bool,
 
     // -- Хотбар ---------------------------------------------------------
     registry:       BlockRegistry,
@@ -40,8 +42,9 @@ impl PlayerController {
     pub fn new(physics: &mut PhysicsWorld, registry: BlockRegistry) -> Self {
         debug_log!("PlayerController", "new", "Creating player body + hotbar");
 
-        let body_handle = physics.create_box_body(SPAWN, PLAYER_HALF_W, PLAYER_HALF_H);
-
+        let (body_handle, collider_handle) = physics.create_box_body(
+            SPAWN, PLAYER_HALF_W, PLAYER_HALF_H,
+        );
         // Хотбар — все solid-блоки из registry
         let mut hotbar_ids   = Vec::new();
         let mut hotbar_names = Vec::new();
@@ -65,6 +68,8 @@ impl PlayerController {
 
         Self {
             body_handle,
+            collider_handle,
+            fly_mode: false,
             on_ground: false,
             registry,
             selected_slot: 0,
@@ -72,7 +77,29 @@ impl PlayerController {
             hotbar_names,
         }
     }
+    // -----------------------------------------------------------------------
+    // Режим свободной камеры (NOC / Fly)
+    // -----------------------------------------------------------------------
 
+    /// Переключает режим свободной камеры.
+    /// В режиме полёта гравитация отключается, игрок может летать в любом
+    /// направлении (Space — вверх, Shift — вниз), коллизии сохраняются.
+    pub fn toggle_fly(&mut self, physics: &mut PhysicsWorld) {
+        self.fly_mode = !self.fly_mode;
+        if self.fly_mode {
+            physics.set_body_gravity_scale(self.body_handle, 0.0);
+            physics.enable_collider(self.collider_handle, false);
+            physics.set_linvel(self.body_handle, Vec3::ZERO);
+            debug_log!("PlayerController", "toggle_fly", "Fly mode ON (no collisions)");
+        } else {
+            physics.set_body_gravity_scale(self.body_handle, 1.0);
+            physics.enable_collider(self.collider_handle, true);
+            physics.set_linvel(self.body_handle, Vec3::ZERO);
+            debug_log!("PlayerController", "toggle_fly", "Fly mode OFF");
+        }
+    }
+
+    pub fn is_fly_mode(&self) -> bool { self.fly_mode }
     // -----------------------------------------------------------------------
     // Движение и прыжок — вызывать ДО physics.step()
     // -----------------------------------------------------------------------
@@ -81,35 +108,72 @@ impl PlayerController {
     /// Горизонтальные составляющие берутся напрямую из ввода (FPS-движение).
     /// При friction=0 на коллайдере rapier сам убирает компонент, упирающийся в стену,
     /// оставляя параллельный — это и есть скольжение по стенам.
+    /// Устанавливает скорость тела.
+    /// В обычном режиме — горизонтальное FPS-движение + прыжок с гравитацией.
+    /// В режиме полёта — прямое управление во всех направлениях, гравитация = 0.
     pub fn apply_movement(
         &mut self,
         physics:   &mut PhysicsWorld,
         move_dir:  Vec3,
         jump:      bool,
+        fly_down:  bool,
     ) {
-        let speed  = if move_dir.length_squared() > 1e-6 { PLAYER_SPEED } else { 0.0 };
-        let cur_vy = physics.get_linvel(self.body_handle).y;
+        if self.fly_mode {
+            // ── Fly mode: free movement, no gravity ──
+            let mut fly_dir = move_dir;
+            if jump     { fly_dir.y += 1.0; }
+            if fly_down { fly_dir.y -= 1.0; }
 
-        let new_vy = if jump && self.on_ground {
-            ext_debug_log!("PlayerController", "apply_movement", "Jump! vy={}", PLAYER_JUMP_VEL);
-            PLAYER_JUMP_VEL
-        } else if self.on_ground && cur_vy.abs() < 0.5 {
-            0.0
+            let speed = if fly_dir.length_squared() > 1e-6 {
+                fly_dir = fly_dir.normalize();
+                FLY_SPEED
+            } else {
+                0.0
+            };
+
+            physics.set_linvel(
+                self.body_handle,
+                Vec3::new(fly_dir.x * speed, fly_dir.y * speed, fly_dir.z * speed),
+            );
         } else {
-            cur_vy
-        };
+            // ── Normal mode: FPS movement + gravity ──
+            let speed  = if move_dir.length_squared() > 1e-6 { PLAYER_SPEED } else { 0.0 };
+            let cur_vy = physics.get_linvel(self.body_handle).y;
 
-        physics.set_linvel(
-            self.body_handle,
-            Vec3::new(move_dir.x * speed, new_vy, move_dir.z * speed),
-        );
+            let new_vy = if jump && self.on_ground {
+                ext_debug_log!("PlayerController", "apply_movement", "Jump! vy={}", PLAYER_JUMP_VEL);
+                PLAYER_JUMP_VEL
+            } else if self.on_ground && cur_vy.abs() < 0.5 {
+                0.0
+            } else {
+                cur_vy
+            };
+
+            physics.set_linvel(
+                self.body_handle,
+                Vec3::new(move_dir.x * speed, new_vy, move_dir.z * speed),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
     // Пост-шаговое обновление — вызывать ПОСЛЕ physics.step()
     // -----------------------------------------------------------------------
 
+    /// Пост-шаговое обновление — вызывать ПОСЛЕ physics.step().
+    /// В режиме полёта пропускает проверку земли и void-respawn.
     pub fn update(&mut self, physics: &mut PhysicsWorld) {
+        if self.fly_mode {
+            flow_debug_log!(
+                "PlayerController", "update",
+                "FLY pos=({:.1},{:.1},{:.1})",
+                self.player_position(physics).x,
+                self.player_position(physics).y,
+                self.player_position(physics).z,
+            );
+            return;
+        }
+
         self.on_ground = physics.check_ground(self.body_handle, PLAYER_HALF_H);
         physics.void_respawn(self.body_handle, SPAWN);
 

@@ -3,7 +3,7 @@
 // =============================================================================
 
 use crate::debug_log;
-use crate::screens::bitmap_font::BitmapFont;
+use egui::{Color32, FontId, Pos2, Align2, Stroke, Rect};
 use crate::screens::gpu_info;
 
 /// Rolling-window FPS tracker and debug HUD renderer.
@@ -24,11 +24,8 @@ pub struct DebugOverlay {
     frame_budget_ms: f64,
     /// Total VRAM currently allocated (bytes) — sum of pipeline + UI + font.
     vram_used_mb: f64,
-    /// Whether the overlay was initialised (first render call).
-    ready: bool,
-    /// Background rectangle dimensions (updated each frame).
-    _bg_width: f32,
-    _bg_height: f32,
+
+
 }
 
 impl DebugOverlay {
@@ -42,9 +39,7 @@ impl DebugOverlay {
             gpu_load: 0.0,
             frame_budget_ms: 1000.0 / 60.0, // 60 FPS target
             vram_used_mb: 0.0,
-            ready: false,
-            _bg_width: 0.0,
-            _bg_height: 0.0,
+
         }
     }
 
@@ -74,69 +69,65 @@ impl DebugOverlay {
         self.vram_used_mb = vram_used_bytes as f64 / (1024.0 * 1024.0);
     }
 
-    /// Draws the debug HUD in the top-left corner of the screen.
-    ///
-    /// Must be called **after** the 3D pass so it renders on top.
-    pub fn draw(
-        &self,
-        font: &BitmapFont,
-        encoder: &mut wgpu::CommandEncoder,
-        view: &wgpu::TextureView,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        width: u32,
-        height: u32,
-    ) {
-        let scale = 1.5_f32;
+
+
+    /// Draws the debug HUD using egui Painter. Call from `build_ui()`.
+    pub fn draw_egui(&self, painter: &egui::Painter) {
         let padding = 10.0_f32;
-        let line_h = BitmapFont::char_height() * scale + 4.0;
+        let line_h  = 25.0_f32;
+        let font_id = FontId::proportional(15.0);
         let x0 = padding;
-        let mut y = padding;
+        let y0 = padding;
 
-        // -- FPS (yellow) --------------------------------------------------------
-        let fps_text = format!("FPS: {:.1} ({:.2} ms)", self.fps, self.frame_time_ms);
-        font.draw_text(
-            encoder, view, device, queue,
-            &fps_text, x0, y,
-            [1.0, 1.0, 0.0, 1.0],
-            scale, width, height,
-        );
-        y += line_h;
+        // Собираем строки — храним String, не &str
+        let lines: Vec<(String, Color32)> = vec![
+            (
+                format!("FPS: {:.1} ({:.2} ms)", self.fps, self.frame_time_ms),
+                Color32::YELLOW,
+            ),
+            (
+                format!("GPU Load: {:.1}%", self.gpu_load),
+                if self.gpu_load < 60.0 {
+                    Color32::GREEN
+                } else if self.gpu_load < 85.0 {
+                    Color32::YELLOW
+                } else {
+                    Color32::RED
+                },
+            ),
+            (
+                format!("VRAM: {:.2} MB", self.vram_used_mb),
+                Color32::from_rgb(0, 230, 230),
+            ),
+            (
+                format!("GPU: {}", crate::screens::gpu_info::get()),
+                Color32::from_rgba_unmultiplied(255, 255, 255, 153),
+            ),
+        ];
 
-        // -- GPU load (green < 60%, yellow < 85%, red >= 85%) --------------------
-        let (r, g, b) = if self.gpu_load < 60.0 {
-            (0.0, 1.0, 0.0)
-        } else if self.gpu_load < 85.0 {
-            (1.0, 1.0, 0.0)
-        } else {
-            (1.0, 0.0, 0.0)
-        };
-        let load_text = format!("GPU Load: {:.1}%", self.gpu_load);
-        font.draw_text(
-            encoder, view, device, queue,
-            &load_text, x0, y,
-            [r, g, b, 1.0],
-            scale, width, height,
+        // Фон (полупрозрачный тёмный)
+        let bg_height = lines.len() as f32 * line_h + padding;
+        let bg_width  = 280.0;
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(x0 - 6.0, y0 - 6.0),
+                egui::Vec2::new(bg_width, bg_height),
+            ),
+            4.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 140),
         );
-        y += line_h;
 
-        // -- VRAM (cyan) ---------------------------------------------------------
-        let vram_text = format!("VRAM: {:.2} MB", self.vram_used_mb);
-        font.draw_text(
-            encoder, view, device, queue,
-            &vram_text, x0, y,
-            [0.0, 0.9, 0.9, 1.0],
-            scale, width, height,
-        );
-        y += line_h;
-
-        // -- GPU name (white, dimmed) --------------------------------------------
-        let gpu_text = format!("GPU: {}", gpu_info::get());
-        font.draw_text(
-            encoder, view, device, queue,
-            &gpu_text, x0, y,
-            [1.0, 1.0, 1.0, 0.6],
-            scale, width, height,
-        );
+        // Отрисовка строк
+        let mut y = y0;
+        for (text, color) in &lines {
+            painter.text(
+                Pos2::new(x0, y),
+                Align2::LEFT_TOP,
+                text.as_str(),
+                font_id.clone(),
+                *color,
+            );
+            y += line_h;
+        }
     }
 }

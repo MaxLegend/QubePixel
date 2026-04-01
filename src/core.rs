@@ -9,3 +9,6 @@ pub mod config;
 pub(crate) mod raycast;
 pub(crate) mod physics;
 pub(crate) mod player;
+pub(crate) mod egui_fonts;
+pub(crate) mod egui_manager;
+

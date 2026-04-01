@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use egui::emath::Real;
 use rapier3d::prelude::*;
-use crate::{debug_log, ext_debug_log};
+use crate::{debug_log, ext_debug_log, flow_debug_log};
 use glam::Vec3;
 use crate::core::gameobjects::world::ChunkBlockData;
 
@@ -15,6 +15,12 @@ use crate::core::gameobjects::world::ChunkBlockData;
 const GROUND_CHECK_DIST: f32 = 0.15;
 pub const VOID_Y: f32        = -20.0;
 const MAX_PHYSICS_DT: f32    = 1.0 / 20.0;
+// -----------------------------------------------------------------------
+// Управление свойствами тел
+// -----------------------------------------------------------------------
+
+/// Устанавливает масштаб гравитации для конкретного тела.
+/// 0.0 = тело не подвержено гравитации (полёт), 1.0 = нормальная гравитация.
 
 // ---------------------------------------------------------------------------
 // Вспомогательные конвертеры glam ↔ nalgebra
@@ -77,7 +83,7 @@ impl PhysicsWorld {
         pos:    Vec3,
         half_w: f32,
         half_h: f32,
-    ) -> RigidBodyHandle {
+    ) -> (RigidBodyHandle, ColliderHandle) {
         let body = RigidBodyBuilder::dynamic()
             .translation(to_vector(pos))
             .lock_rotations()
@@ -88,13 +94,15 @@ impl PhysicsWorld {
             .restitution(0.0)
             .contact_skin(0.02)
             .build();
-        let handle = self.rigid_body_set.insert(body);
-        self.collider_set.insert_with_parent(collider, handle, &mut self.rigid_body_set);
+        let body_handle = self.rigid_body_set.insert(body);
+        let collider_handle = self.collider_set.insert_with_parent(
+            collider, body_handle, &mut self.rigid_body_set,
+        );
         debug_log!(
             "PhysicsWorld", "create_box_body",
             "Box body at ({:.1},{:.1},{:.1}) hw={} hh={}", pos.x, pos.y, pos.z, half_w, half_h
         );
-        handle
+        (body_handle, collider_handle)
     }
 
     // -----------------------------------------------------------------------
@@ -173,7 +181,18 @@ impl PhysicsWorld {
             &(),
         );
     }
-
+    pub fn set_body_gravity_scale(&mut self, handle: RigidBodyHandle, scale: f32) {
+        if let Some(body) = self.rigid_body_set.get_mut(handle) {
+            body.set_gravity_scale(scale, true);
+        }
+    }
+    /// Включает/выключает коллайдер тела.
+    /// При enabled=false тело не участвует в коллизиях — можно проходить сквозь блоки.
+    pub fn enable_collider(&mut self, handle: ColliderHandle, enabled: bool) {
+        if let Some(collider) = self.collider_set.get_mut(handle) {
+            collider.set_enabled(enabled);
+        }
+    }
     // -----------------------------------------------------------------------
     // Синхронизация коллайдеров чанков (без изменений)
     // -----------------------------------------------------------------------
@@ -233,7 +252,7 @@ impl PhysicsWorld {
         }
 
         if added_count > 0 || !removed.is_empty() {
-            debug_log!(
+            flow_debug_log!(
                 "PhysicsWorld", "sync_chunks",
                 "Synced: added={} removed={} total={}",
                 added_count, removed.len(), self.chunk_colliders.len()

@@ -210,6 +210,22 @@ impl World {
 
             gen_time_us = t0.elapsed().as_micros();
 
+            // Before inserting, mark existing neighbor chunks dirty
+            // so they rebuild with correct cross-chunk boundary culling.
+            for &(key, _) in &new_chunks {
+                let offsets: [(i32, i32, i32); 6] = [
+                    (1, 0, 0), (-1, 0, 0),
+                    (0, 1, 0), (0, -1, 0),
+                    (0, 0, 1), (0, 0, -1),
+                ];
+                for &(dx, dy, dz) in &offsets {
+                    let nk = (key.0 + dx, key.1 + dy, key.2 + dz);
+                    if let Some(neighbor) = self.chunks.get_mut(&nk) {
+                        neighbor.mesh_dirty = true;
+                    }
+                }
+            }
+
             for (key, chunk) in new_chunks {
                 self.chunks.insert(key, chunk);
             }
@@ -264,54 +280,106 @@ impl World {
     // -----------------------------------------------------------------------
 
     /// Builds GPU-ready mesh data for chunks that are marked `mesh_dirty`.
-    /// Returns `(meshes, build_time_us)` — mesh data and wall-clock profiling.
+    /// Uses cross-chunk neighbor lookup to cull faces on chunk boundaries.
+    /// Returns `(meshes, build_time_us)`.
     pub fn build_meshes(
         &mut self,
     ) -> (Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>, u128) {
-        let s = CHUNK_SIZE as f32;
         let total = self.chunks.len();
-
-        let chunks   = &mut self.chunks;
-        let registry = &self.registry;
-
         let t0 = Instant::now();
 
-        let result: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])> = chunks
-            .par_iter_mut()
-            .filter_map(|(key, chunk)| {
-                if !chunk.mesh_dirty {
-                    return None;
-                }
+        // ── Phase 1: collect dirty keys & clear flags (mutable access) ──
+        let dirty_keys: Vec<(i32, i32, i32)> = self.chunks.iter()
+            .filter_map(|(&key, chunk)| {
+                if chunk.mesh_dirty { Some(key) } else { None }
+            })
+            .collect();
 
-                let (verts, idxs) = chunk.build_mesh(registry, &self.atlas_layout);
+        for &key in &dirty_keys {
+            if let Some(chunk) = self.chunks.get_mut(&key) {
                 chunk.mesh_dirty = false;
+            }
+        }
 
-                if verts.is_empty() {
-                    return None;
-                }
+        let dirty_count = dirty_keys.len();
 
-                let min = [
-                    chunk.cx as f32 * s,
-                    chunk.cy as f32 * s,
-                    chunk.cz as f32 * s,
-                ];
+        // ── Phase 2: parallel mesh build with read-only chunk access ──
+        // Re-borrow self.chunks as immutable so rayon closures can read
+        // neighboring chunks for cross-boundary face culling.
+        let chunks   = &self.chunks;
+        let registry = &self.registry;
+        let atlas    = &self.atlas_layout;
+        let cs       = CHUNK_SIZE as i32;
+
+        let result: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])> = dirty_keys
+            .into_par_iter()
+            .filter_map(|key| {
+                let chunk = match chunks.get(&key) {
+                    Some(c) => c,
+                    None    => return None,
+                };
+
+                // Neighbor lookup: world coords → block ID.
+                // Returns 0 (Air) when the chunk is not loaded → face is
+                // drawn (conservative).
+                let get_neighbor = |wx: i32, wy: i32, wz: i32| -> u8 {
+                    let cx = wx.div_euclid(cs);
+                    let cy = wy.div_euclid(cs);
+                    let cz = wz.div_euclid(cs);
+                    let lx = wx.rem_euclid(cs) as usize;
+                    let ly = wy.rem_euclid(cs) as usize;
+                    let lz = wz.rem_euclid(cs) as usize;
+                    chunks.get(&(cx, cy, cz))
+                        .map_or(0, |c| c.get(lx, ly, lz))
+                };
+
+                let (verts, idxs) = chunk.build_mesh(registry, atlas, get_neighbor);
+
+                if verts.is_empty() { return None; }
+
+                let s   = CHUNK_SIZE as f32;
+                let min = [chunk.cx as f32 * s, chunk.cy as f32 * s, chunk.cz as f32 * s];
                 let max = [min[0] + s, min[1] + s, min[2] + s];
-                Some((*key, verts, idxs, min, max))
+                Some((key, verts, idxs, min, max))
             })
             .collect();
 
         let build_time_us = t0.elapsed().as_micros();
 
-        debug_log!(
+        flow_debug_log!(
             "World", "build_meshes",
             "[PERF] build={:.2}ms dirty={}/{} total_chunks={}",
             build_time_us as f64 / 1000.0,
-            result.len(), total, total
+            result.len(), dirty_count, total
         );
 
         (result, build_time_us)
     }
+    // -----------------------------------------------------------------------
+    // Neighbor invalidation
+    // -----------------------------------------------------------------------
 
+    /// Marks a chunk as dirty for mesh rebuild if it exists.
+    fn mark_dirty(&mut self, cx: i32, cy: i32, cz: i32) {
+        if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
+            chunk.mesh_dirty = true;
+        }
+    }
+
+    /// If `lx/ly/lz` is on a chunk boundary, mark the adjacent chunk dirty
+    /// so it rebuilds its mesh with updated cross-chunk face culling.
+    fn dirty_boundary_neighbors(
+        &mut self,
+        cx: i32, cy: i32, cz: i32,
+        lx: usize, ly: usize, lz: usize,
+    ) {
+        if lx == 0                 { self.mark_dirty(cx - 1, cy, cz); }
+        if lx == CHUNK_SIZE - 1    { self.mark_dirty(cx + 1, cy, cz); }
+        if ly == 0                 { self.mark_dirty(cx, cy - 1, cz); }
+        if ly == CHUNK_SIZE - 1    { self.mark_dirty(cx, cy + 1, cz); }
+        if lz == 0                 { self.mark_dirty(cx, cy, cz - 1); }
+        if lz == CHUNK_SIZE - 1    { self.mark_dirty(cx, cy, cz + 1); }
+    }
     // -----------------------------------------------------------------------
     // Queries
     // -----------------------------------------------------------------------
@@ -345,17 +413,20 @@ impl World {
         let cx = wx.div_euclid(cs);
         let cy = wy.div_euclid(cs);
         let cz = wz.div_euclid(cs);
+        let lx = wx.rem_euclid(cs) as usize;
+        let ly = wy.rem_euclid(cs) as usize;
+        let lz = wz.rem_euclid(cs) as usize;
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
-            let lx = wx.rem_euclid(cs) as usize;
-            let ly = wy.rem_euclid(cs) as usize;
-            let lz = wz.rem_euclid(cs) as usize;
             chunk.set(lx, ly, lz, 0);
             debug_log!(
                 "World", "remove_block",
                 "Broke block at ({}, {}, {})", wx, wy, wz
             );
         }
+
+        // Rebuild adjacent chunk's mesh if block was on a boundary
+        self.dirty_boundary_neighbors(cx, cy, cz, lx, ly, lz);
     }
 
     /// Place a block at world coordinates.
@@ -367,17 +438,20 @@ impl World {
         let cx = wx.div_euclid(cs);
         let cy = wy.div_euclid(cs);
         let cz = wz.div_euclid(cs);
+        let lx = wx.rem_euclid(cs) as usize;
+        let ly = wy.rem_euclid(cs) as usize;
+        let lz = wz.rem_euclid(cs) as usize;
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
-            let lx = wx.rem_euclid(cs) as usize;
-            let ly = wy.rem_euclid(cs) as usize;
-            let lz = wz.rem_euclid(cs) as usize;
             chunk.set(lx, ly, lz, block_id);
             debug_log!(
                 "World", "place_block",
                 "Placed block {} at ({}, {}, {})", block_id, wx, wy, wz
             );
         }
+
+        // Rebuild adjacent chunk's mesh if block was on a boundary
+        self.dirty_boundary_neighbors(cx, cy, cz, lx, ly, lz);
     }
 }
 

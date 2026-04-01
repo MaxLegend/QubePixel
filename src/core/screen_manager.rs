@@ -127,7 +127,12 @@ impl ScreenManager {
             entry.screen.post_process(dt);
         }
     }
-
+    /// Build egui UI for the active screen.
+    pub fn build_ui(&mut self, ctx: &egui::Context) {
+        if let Some(entry) = self.entries.last_mut() {
+            entry.screen.build_ui(ctx);
+        }
+    }
     pub fn on_event(&mut self, event: &WindowEvent) {
         if let Some(entry) = self.entries.last_mut() {
             entry.screen.on_event(event);

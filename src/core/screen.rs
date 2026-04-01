@@ -59,7 +59,9 @@ pub trait Screen {
     }
 
     fn unload(&mut self) {}
-
+    /// Build egui UI for this screen. Called every frame after 3D rendering.
+    /// Override in screens that use egui for menus, HUD, popups, etc.
+    fn build_ui(&mut self, _ctx: &egui::Context) {}
     fn clear_color(&self) -> wgpu::Color {
         wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
     }
