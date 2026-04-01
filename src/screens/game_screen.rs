@@ -9,7 +9,8 @@ use std::time::Instant;
 use crate::screens::debug_overlay::DebugOverlay;
 use crate::screens::profiler_overlay::{ProfilerOverlay, ProfilerFrame};
 use crate::screens::game_3d_pipeline::{Camera, Game3DPipeline};
-use crate::core::upload_worker::{UploadWorker, UploadJob};
+use std::collections::VecDeque;
+use crate::core::upload_worker::{UploadWorker, UploadJob, UploadPacked};
 use crate::core::gameobjects::world::{WorldWorker, WorldResult, BlockOp};
 use winit::event::{ElementState, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -23,6 +24,10 @@ use glam::Vec3;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2, Align2, Rounding};
 use crate::core::config;
 
+
+const MAX_GPU_UPLOADS_PER_FRAME: usize = 32;
+
+
 pub struct GameScreen {
     // -- 3D ------------------------------------------------------------------
     camera:      Camera,
@@ -32,7 +37,7 @@ pub struct GameScreen {
     pending_world_result: Option<WorldResult>,
     last_upload_us: u128,
     upload_worker: UploadWorker,
-
+    upload_queue: VecDeque<UploadPacked>,
     // -- Debug + Profiler ----------------------------------------------------
     debug:    DebugOverlay,
     profiler: ProfilerOverlay,
@@ -85,6 +90,7 @@ impl GameScreen {
             pending_world_result: None,
             last_upload_us: 0,
             upload_worker: UploadWorker::new(),
+            upload_queue: VecDeque::new(),
             atlas,
 
             debug:    DebugOverlay::new(),
@@ -235,7 +241,7 @@ impl Screen for GameScreen {
 
         self.atlas.ensure_gpu(device, queue);
 
-        // Upload meshes from WorldResult
+        // --- Dispatch world result: eviction + submit to packing worker ---
         if let Some(result) = self.pending_world_result.take() {
             let pipeline = self.pipeline_3d.as_mut().unwrap();
 
@@ -244,7 +250,7 @@ impl Screen for GameScreen {
                 pipeline.remove_chunk_meshes(&result.evicted);
             }
 
-            // New meshes → UploadWorker
+            // New meshes → UploadWorker (CPU packing)
             if !result.meshes.is_empty() {
                 let jobs: Vec<UploadJob> = result.meshes
                     .into_iter()
@@ -256,51 +262,73 @@ impl Screen for GameScreen {
             }
         }
 
-        // Poll packed results and create GPU buffers
+        // --- Poll packed results into GPU upload queue ---
+        {
+            let packed_results = self.upload_worker.poll();
+            for r in packed_results {
+                self.upload_queue.push_back(r);
+            }
+        }
+
+        // --- Budgeted GPU upload: at most MAX_GPU_UPLOADS_PER_FRAME per frame ---
+        // Uses mapped_at_creation to bypass internal wgpu staging overhead.
         let upload_time_us;
         let upload_count;
         {
             let pipeline = self.pipeline_3d.as_mut().unwrap();
-            let packed_results = self.upload_worker.poll();
-            upload_count = packed_results.len();
+            let budget = MAX_GPU_UPLOADS_PER_FRAME.min(self.upload_queue.len());
 
-            if !packed_results.is_empty() {
+            if budget > 0 {
                 let t0 = Instant::now();
 
-                for r in packed_results {
+                for _ in 0..budget {
+                    let r = self.upload_queue.pop_front().unwrap();
+
+                    let vb_size = r.vertex_data.len() as u64;
+                    let ib_size = r.index_data.len() as u64;
+
+                    // Vertex buffer — mapped_at_creation skips write_buffer's
+                    // internal staging allocation; we memcpy directly.
                     let vb = device.create_buffer(&wgpu::BufferDescriptor {
-                        label:              Some("Chunk VB (staged)"),
-                        size:               r.vertex_data.len() as u64,
+                        label:              Some("Chunk VB (async)"),
+                        size:               vb_size,
                         usage:              wgpu::BufferUsages::VERTEX
                             | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
+                        mapped_at_creation: true,
                     });
-                    queue.write_buffer(&vb, 0, &r.vertex_data);
+                    vb.slice(..).get_mapped_range_mut()
+                        .copy_from_slice(&r.vertex_data);
+                    vb.unmap();
 
+                    // Index buffer — same pattern
                     let ib = device.create_buffer(&wgpu::BufferDescriptor {
-                        label:              Some("Chunk IB (staged)"),
-                        size:               r.index_data.len() as u64,
+                        label:              Some("Chunk IB (async)"),
+                        size:               ib_size,
                         usage:              wgpu::BufferUsages::INDEX
                             | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
+                        mapped_at_creation: true,
                     });
-                    queue.write_buffer(&ib, 0, &r.index_data);
-
-                    let v_vram = r.vertex_data.len() as u64;
-                    let i_vram = r.index_data.len() as u64;
+                    ib.slice(..).get_mapped_range_mut()
+                        .copy_from_slice(&r.index_data);
+                    ib.unmap();
 
                     pipeline.insert_chunk_mesh(
                         r.key, vb, ib, r.index_count,
-                        v_vram + i_vram,
+                        vb_size + ib_size,
                         r.aabb_min, r.aabb_max,
                     );
                 }
 
                 upload_time_us = t0.elapsed().as_micros();
+                upload_count = budget;
             } else {
                 upload_time_us = 0;
+                upload_count = 0;
             }
         }
+
+        self.last_upload_us = upload_time_us;
+        self.last_upload_count = upload_count;
 
         self.last_upload_us = upload_time_us;
         self.last_upload_count = upload_count;
@@ -340,6 +368,7 @@ impl Screen for GameScreen {
             lod2_count:      self.last_lod_counts[2],
             worker_pending:  self.last_worker_pending,
             upload_pending:  self.upload_worker.pending_count(),
+            gpu_queue_depth: self.upload_queue.len(),
             vram_bytes:      vram,
         });
     }
