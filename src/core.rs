@@ -12,4 +12,5 @@ pub(crate) mod player;
 pub(crate) mod egui_fonts;
 pub(crate) mod egui_manager;
 pub(crate) mod upload_worker;
+pub mod lighting;
 

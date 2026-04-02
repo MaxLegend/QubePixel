@@ -1,21 +1,6 @@
 // =============================================================================
 // QubePixel — UploadWorker  (parallel CPU staging + main-thread GPU upload)
 // =============================================================================
-//
-// Offloads CPU-heavy mesh data packing to a background thread while the
-// render thread stays free for drawing.  GPU buffer creation and upload
-// (create_buffer + write_buffer) happen on the main thread because they are
-// lightweight in wgpu (just record commands, actual GPU work is async).
-//
-// Flow:
-//   Main thread                    Worker thread (CPU only)
-//   ──────────                    ──────────────────────────
-//   submit(jobs)  ──────────────►  pack vertices/indices
-//                                  into contiguous staging buffer
-//   poll()  ◄──────────────────  send UploadPacked
-//   create_buffer + write_buffer
-//   insert into pipeline
-// =============================================================================
 
 use std::sync::mpsc;
 use std::thread;
@@ -50,7 +35,9 @@ pub struct UploadPacked {
 // UploadWorker
 // ---------------------------------------------------------------------------
 pub struct UploadWorker {
-    job_tx:    mpsc::Sender<UploadJob>,
+    /// Wrapped in Option so it can be explicitly dropped before join(),
+    /// causing the background thread's recv() to return Err and exit cleanly.
+    job_tx:    Option<mpsc::Sender<UploadJob>>,
     packed_rx: mpsc::Receiver<UploadPacked>,
     thread:    Option<thread::JoinHandle<()>>,
     pending:   usize,
@@ -73,10 +60,11 @@ impl UploadWorker {
                 let mut total_packed = 0usize;
 
                 loop {
-                    // Block until at least one job arrives
+                    // Block until at least one job arrives.
+                    // When job_tx is dropped, recv() returns Err → clean exit.
                     let first = match job_rx.recv() {
                         Ok(job) => job,
-                        Err(_)  => break, // channel closed → shutdown
+                        Err(_)  => break,
                     };
 
                     // Drain every additional pending job into a single batch
@@ -89,7 +77,7 @@ impl UploadWorker {
                     let t0        = Instant::now();
                     let batch_len = batch.len();
 
-                    // ── Calculate total staging size ───────────────────────
+                    // Calculate total staging size
                     let mut needed: usize = 0;
                     for job in &batch {
                         needed += job.vertices.len() * vert_stride;
@@ -104,7 +92,6 @@ impl UploadWorker {
                     staging.clear();
                     staging.resize(needed, 0);
 
-                    // ── Pack each job's data into staging ──────────────────
                     let mut offset = 0usize;
                     let mut packed = 0usize;
 
@@ -116,7 +103,6 @@ impl UploadWorker {
                         let vert_bytes = job.vertices.len() * vert_stride;
                         let idx_bytes  = job.indices.len()  * idx_stride;
 
-                        // Copy vertex data
                         let vert_off = offset;
                         unsafe {
                             std::ptr::copy_nonoverlapping(
@@ -127,7 +113,6 @@ impl UploadWorker {
                         }
                         offset += vert_bytes;
 
-                        // Copy index data
                         let idx_off = offset;
                         unsafe {
                             std::ptr::copy_nonoverlapping(
@@ -138,7 +123,6 @@ impl UploadWorker {
                         }
                         offset += idx_bytes;
 
-                        // Extract packed slices as owned Vecs
                         let vertex_data: Vec<u8> =
                             staging[vert_off..vert_off + vert_bytes].to_vec();
                         let index_data: Vec<u8> =
@@ -158,7 +142,6 @@ impl UploadWorker {
                     }
 
                     let us = t0.elapsed().as_micros();
-
                     flow_debug_log!(
                         "UploadWorker", "thread",
                         "[PERF] batch={} packed={} total={} time={:.2}ms staging={:.1}KB",
@@ -168,14 +151,14 @@ impl UploadWorker {
                     );
                 }
 
-                debug_log!("UploadWorker", "thread", "Background thread exiting");
+                debug_log!("UploadWorker", "thread", "Background thread exiting cleanly");
             })
             .expect("Failed to spawn gpu-staging thread");
 
         debug_log!("UploadWorker", "new", "Spawned staging worker thread");
 
         Self {
-            job_tx,
+            job_tx: Some(job_tx),
             packed_rx,
             thread: Some(handle),
             pending: 0,
@@ -189,8 +172,10 @@ impl UploadWorker {
     /// Submit a batch of mesh jobs for async CPU packing.  Non-blocking.
     pub fn submit(&mut self, jobs: Vec<UploadJob>) {
         self.pending += jobs.len();
-        for job in jobs {
-            let _ = self.job_tx.send(job);
+        if let Some(tx) = &self.job_tx {
+            for job in jobs {
+                let _ = tx.send(job);
+            }
         }
     }
 
@@ -198,20 +183,32 @@ impl UploadWorker {
     pub fn poll(&mut self) -> Vec<UploadPacked> {
         let mut results = Vec::new();
         while let Ok(r) = self.packed_rx.try_recv() {
-            self.pending -= 1;
+            self.pending = self.pending.saturating_sub(1);
             results.push(r);
         }
         results
     }
 
     pub fn pending_count(&self) -> usize { self.pending }
+
     #[allow(dead_code)]
-    pub fn is_busy(&self)     -> bool   { self.pending > 0 }
+    pub fn is_busy(&self) -> bool { self.pending > 0 }
 }
 
 impl Drop for UploadWorker {
     fn drop(&mut self) {
         debug_log!("UploadWorker", "drop", "Shutting down staging worker");
-        let _ = self.thread.take().and_then(|h| Some(h.join()));
+
+        // IMPORTANT: drop the sender BEFORE joining the thread.
+        // This closes the channel, causing job_rx.recv() in the background
+        // thread to return Err(_), which breaks the loop and lets join() return.
+        // Without this, join() would deadlock because the sender (job_tx)
+        // would still be alive during the join, keeping the channel open.
+        drop(self.job_tx.take());
+
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+            debug_log!("UploadWorker", "drop", "Staging thread joined successfully");
+        }
     }
 }

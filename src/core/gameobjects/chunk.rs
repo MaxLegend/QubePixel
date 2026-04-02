@@ -116,6 +116,27 @@ impl Chunk {
         let mut vertices: Vec<Vertex3D> = Vec::with_capacity(if lod_level == 0 { 1024 } else { 256 });
         let mut indices: Vec<u32> = Vec::with_capacity(if lod_level == 0 { 1536 } else { 384 });
 
+        // Precompute sky occlusion per (col_x, col_z) column.
+        // For each column we check whether any solid block exists above this chunk's ceiling
+        // (up to 64 blocks / 4 chunks above). If yes, all blocks in that column are underground.
+        // This is the Minecraft-style "sky light" propagation, simplified to binary (0/1).
+        let mut col_sky_blocked = [[false; CHUNK_SIZE]; CHUNK_SIZE];
+        {
+            let top_y = wy_base + CHUNK_SIZE as i32; // first Y above this chunk's top
+            for col_x in 0..CHUNK_SIZE {
+                for col_z in 0..CHUNK_SIZE {
+                    let wx_c = wx_base + col_x as i32;
+                    let wz_c = wz_base + col_z as i32;
+                    'sky: for dy in 0..64i32 {
+                        if get_neighbor(wx_c, top_y + dy, wz_c) != 0 {
+                            col_sky_blocked[col_x][col_z] = true;
+                            break 'sky;
+                        }
+                    }
+                }
+            }
+        }
+
         for cx in 0..cells {
             for cy in 0..cells {
                 for cz in 0..cells {
@@ -144,41 +165,126 @@ impl Chunk {
                     let wy = wy_base + by0 as i32;
                     let wz = wz_base + bz0 as i32;
 
-                    // +X face (dir = 0)
+                    // Extract material properties
+                    // Extract material properties
+                    let mat = &def.material;
+                    let material_data = [mat.roughness, mat.metalness];
+                    let emi = &def.emission;
+                    let emission_data = if emi.emit_light {
+                        [emi.light_color[0], emi.light_color[1], emi.light_color[2], emi.light_intensity]
+                    } else {
+                        [0.0, 0.0, 0.0, 0.0]
+                    };
+
+                    // -----------------------------------------------------------------
+                    // Sky light — per-vertex, using world-space column lookup.
+                    // Each vertex samples the column at its own (wx, wz) position,
+                    // producing correct gradients across chunk boundaries.
+                    // -----------------------------------------------------------------
+                    let sky_at_w = |wx: i32, wz: i32| -> f32 {
+                        if emi.emit_light { return 1.0; }
+
+                        let lx = (wx - wx_base) as isize;
+                        let lz = (wz - wz_base) as isize;
+
+                        if lx >= 0 && lx < CHUNK_SIZE as isize
+                            && lz >= 0 && lz < CHUNK_SIZE as isize
+                        {
+                            // Column is inside this chunk — fast local check
+                            let ulx = lx as usize;
+                            let ulz = lz as usize;
+                            if (by0 + step..CHUNK_SIZE)
+                                .any(|ly| self.blocks[ulx][ly][ulz] != 0)
+                            {
+                                return 0.0;
+                            }
+                            if col_sky_blocked[ulx][ulz] {
+                                return 0.0;
+                            }
+                        } else {
+                            // Column is outside this chunk in X/Z —
+                            // check via get_neighbor for all y above this block
+                            let start_y = wy_base + (by0 + step) as i32;
+                            let chunk_top = wy_base + CHUNK_SIZE as i32;
+                            for wy in start_y..chunk_top {
+                                if get_neighbor(wx, wy, wz) != 0 {
+                                    return 0.0;
+                                }
+                            }
+                            for dy in 0..64i32 {
+                                if get_neighbor(wx, chunk_top + dy, wz) != 0 {
+                                    return 0.0;
+                                }
+                            }
+                        }
+                        1.0
+                    };
+
+                    let ws = step as i32;
+
+                    // +X face (dir = 0) — face plane at x = wx + ws
+                    // Vertices at columns (wx+ws, wz) and (wx+ws, wz+ws)
                     if self.is_adjacent_air(bx0 + step, by0, bz0, step, 0, wx, wy, wz, &get_neighbor) {
                         let c = def.color_for_face(0);
                         let uv = atlas.uv_for(def.texture_for_face(0).unwrap_or(""));
-                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 0, c, uv, scale);
+                        let c0 = sky_at_w(wx + ws, wz);
+                        let c1 = sky_at_w(wx + ws, wz + ws);
+                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 0, c, uv, scale, material_data, emission_data,
+                                      [c1, c0, c0, c1]);
                     }
-                    // -X face (dir = 1)
+                    // -X face (dir = 1) — face plane at x = wx
+                    // Vertices at columns (wx, wz) and (wx, wz+ws)
                     if self.is_adjacent_air_neg(bx0, by0, bz0, step, 1, wx, wy, wz, &get_neighbor) {
                         let c = def.color_for_face(1);
                         let uv = atlas.uv_for(def.texture_for_face(1).unwrap_or(""));
-                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 1, c, uv, scale);
+                        let c0 = sky_at_w(wx, wz);
+                        let c1 = sky_at_w(wx, wz + ws);
+                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 1, c, uv, scale, material_data, emission_data,
+                                      [c0, c1, c1, c0]);
                     }
-                    // +Y face (dir = 2)
+                    // +Y face (dir = 2) — face plane at y = oy + scale
+                    // Corners span both X and Z: 4 distinct columns
                     if self.is_adjacent_air(bx0, by0 + step, bz0, step, 2, wx, wy, wz, &get_neighbor) {
                         let c = def.color_for_face(2);
                         let uv = atlas.uv_for(def.texture_for_face(2).unwrap_or(""));
-                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 2, c, uv, scale);
+                        let c00 = sky_at_w(wx,      wz);
+                        let c10 = sky_at_w(wx + ws, wz);
+                        let c11 = sky_at_w(wx + ws, wz + ws);
+                        let c01 = sky_at_w(wx,      wz + ws);
+                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 2, c, uv, scale, material_data, emission_data,
+                                      [c01, c11, c10, c00]);
                     }
-                    // -Y face (dir = 3)
+                    // -Y face (dir = 3) — face plane at y = oy
+                    // Corners span both X and Z: 4 distinct columns
                     if self.is_adjacent_air_neg(bx0, by0, bz0, step, 3, wx, wy, wz, &get_neighbor) {
                         let c = def.color_for_face(3);
                         let uv = atlas.uv_for(def.texture_for_face(3).unwrap_or(""));
-                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 3, c, uv, scale);
+                        let c00 = sky_at_w(wx,      wz);
+                        let c10 = sky_at_w(wx + ws, wz);
+                        let c11 = sky_at_w(wx + ws, wz + ws);
+                        let c01 = sky_at_w(wx,      wz + ws);
+                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 3, c, uv, scale, material_data, emission_data,
+                                      [c00, c10, c11, c01]);
                     }
-                    // +Z face (dir = 4)
+                    // +Z face (dir = 4) — face plane at z = wz + ws
+                    // Vertices at columns (wx, wz+ws) and (wx+ws, wz+ws)
                     if self.is_adjacent_air(bx0, by0, bz0 + step, step, 4, wx, wy, wz, &get_neighbor) {
                         let c = def.color_for_face(4);
                         let uv = atlas.uv_for(def.texture_for_face(4).unwrap_or(""));
-                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 4, c, uv, scale);
+                        let c0 = sky_at_w(wx,      wz + ws);
+                        let c1 = sky_at_w(wx + ws, wz + ws);
+                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 4, c, uv, scale, material_data, emission_data,
+                                      [c0, c1, c1, c0]);
                     }
-                    // -Z face (dir = 5)
+                    // -Z face (dir = 5) — face plane at z = wz
+                    // Vertices at columns (wx, wz) and (wx+ws, wz)
                     if self.is_adjacent_air_neg(bx0, by0, bz0, step, 5, wx, wy, wz, &get_neighbor) {
                         let c = def.color_for_face(5);
                         let uv = atlas.uv_for(def.texture_for_face(5).unwrap_or(""));
-                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 5, c, uv, scale);
+                        let c0 = sky_at_w(wx,      wz);
+                        let c1 = sky_at_w(wx + ws, wz);
+                        emit_face_lod(&mut vertices, &mut indices, ox, oy, oz, 5, c, uv, scale, material_data, emission_data,
+                                      [c1, c0, c0, c1]);
                     }
                 }
             }
@@ -317,10 +423,13 @@ fn emit_face_lod(
     verts: &mut Vec<Vertex3D>,
     idxs:  &mut Vec<u32>,
     ox: f32, oy: f32, oz: f32,
-    dir:   u8,
-    color: [f32; 3],
-    uv:    (f32, f32, f32, f32),
-    scale: f32,
+    dir:      u8,
+    color:    [f32; 3],
+    uv:       (f32, f32, f32, f32),
+    scale:    f32,
+    material: [f32; 2],   // [roughness, metalness]
+    emission: [f32; 4],   // [r, g, b, intensity]
+    sky_light_per_vertex: [f32; 4],
 ) {
     let base = verts.len() as u32;
     let s = scale;
@@ -381,10 +490,14 @@ fn emit_face_lod(
 
     for i in 0..4 {
         verts.push(Vertex3D {
-            position: corners[i],
+            position:  corners[i],
             normal,
             color,
-            texcoord: uvs[i],
+            texcoord:  uvs[i],
+            ao:        1.0,
+            material,
+            emission,
+            sky_light: sky_light_per_vertex[i],
         });
     }
     idxs.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);

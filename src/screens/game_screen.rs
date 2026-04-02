@@ -20,6 +20,8 @@ use crate::core::raycast::RaycastResult;
 use crate::core::physics::PhysicsWorld;
 use crate::core::player::PlayerController;
 use crate::core::gameobjects::block::BlockRegistry;
+use crate::core::lighting::{DayNightCycle, LightingConfig, pack_lighting_uniforms};
+use crate::screens::sky_renderer::SkyRenderer;
 use glam::Vec3;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2, Align2, Rounding};
 use crate::core::config;
@@ -68,6 +70,10 @@ pub struct GameScreen {
     target_block:  Option<RaycastResult>,
     pending_block_ops: Vec<BlockOp>,
     paused:        bool,
+    // -- Lighting ------------------------------------------------------------
+    day_night:       DayNightCycle,
+    lighting_config: LightingConfig,
+    sky_renderer:    SkyRenderer,
     // -- Transition ----------------------------------------------------------
     pending_action: ScreenAction,
 }
@@ -82,6 +88,9 @@ impl GameScreen {
         let mut physics_world = PhysicsWorld::new();
         let registry = BlockRegistry::load();
         let player   = PlayerController::new(&mut physics_world, registry);
+
+        let lighting_config = LightingConfig::load();
+        let day_night = DayNightCycle::new(&lighting_config);
 
         Self {
             camera:      Camera::new(840, 480),
@@ -118,6 +127,11 @@ impl GameScreen {
             target_block:  None,
             paused:        false,
             pending_block_ops: Vec::new(),
+
+            day_night,
+            lighting_config,
+            sky_renderer: SkyRenderer::new(),
+
             pending_action: ScreenAction::None,
         }
     }
@@ -162,6 +176,9 @@ impl Screen for GameScreen {
 
     fn update(&mut self, dt: f64) {
         let t_update_start = Instant::now();
+
+        // Advance day-night cycle
+        self.day_night.update(dt);
 
         self.process_input(dt);
 
@@ -336,10 +353,38 @@ impl Screen for GameScreen {
         let pipeline = self.pipeline_3d.as_mut().unwrap();
         self.camera.update_aspect(width, height);
 
-        // 3D render
+        // Sky billboard rendering (sun/moon) — before 3D terrain
+        self.sky_renderer.render(
+            encoder, view, device, queue, format,
+            &self.camera, &self.day_night,
+        );
+
+        // 3D render — pack lighting uniforms and pass to pipeline
         let atlas_view = self.atlas.texture_view().unwrap();
+        let vp = self.camera.view_projection_matrix();
+        
+        let sun_dir = self.day_night.sun_direction();
+        let center = self.camera.position;
+        let dist = 100.0;
+        let up = if sun_dir.y.abs() > 0.99 { glam::Vec3::Z } else { glam::Vec3::Y };
+        let shadow_view = glam::Mat4::look_at_rh(
+            center + sun_dir * dist,
+            center,
+            up,
+        );
+        let ext = 64.0;
+        let shadow_proj = glam::Mat4::orthographic_rh(-ext, ext, -ext, ext, 1.0, 200.0);
+        let shadow_view_proj = shadow_proj * shadow_view;
+
+        let lighting_data = pack_lighting_uniforms(
+            &vp,
+            self.camera.position,
+            &self.day_night,
+            &self.lighting_config,
+            &shadow_view_proj,
+        );
         let render_us = pipeline.render(
-            encoder, view, device, queue, &self.camera, width, height, atlas_view,
+            encoder, view, device, queue, &self.camera, width, height, atlas_view, &lighting_data,
         );
 
         // Block outline
@@ -467,6 +512,25 @@ impl Screen for GameScreen {
 
         // =================== Profiler overlay (right) =======================
         self.profiler.draw_egui(&painter, sw);
+
+        // =================== Time speed HUD (top-right) ====================
+        {
+            let speed_label = self.day_night.time_speed.label();
+            let time = self.day_night.time_of_day();
+            let hours = (time * 24.0) as u32;
+            let minutes = ((time * 24.0 - hours as f32) * 60.0) as u32;
+            let time_text = format!(
+                "{:02}:{:02}  Speed: {}  (T/Shift+T/Ctrl+T)",
+                hours, minutes, speed_label
+            );
+            painter.text(
+                Pos2::new(sw - 10.0, 8.0),
+                Align2::RIGHT_TOP,
+                &time_text,
+                FontId::proportional(14.0),
+                Color32::from_rgba_unmultiplied(255, 255, 200, 180),
+            );
+        }
 
         // =================== Pause menu =====================================
         if self.paused {
@@ -784,6 +848,32 @@ impl Screen for GameScreen {
                                 KeyCode::Digit7 => self.player.select_slot(6),
                                 KeyCode::Digit8 => self.player.select_slot(7),
                                 KeyCode::Digit9 => self.player.select_slot(8),
+                                // -- Time controls --
+                                KeyCode::KeyT => {
+                                    let shift = self.keys.contains(&PhysicalKey::Code(KeyCode::ShiftLeft))
+                                             || self.keys.contains(&PhysicalKey::Code(KeyCode::ShiftRight));
+                                    let ctrl  = self.keys.contains(&PhysicalKey::Code(KeyCode::ControlLeft))
+                                             || self.keys.contains(&PhysicalKey::Code(KeyCode::ControlRight));
+                                    if shift {
+                                        self.day_night.time_speed = self.day_night.time_speed.faster();
+                                        debug_log!("GameScreen", "on_event",
+                                            "Time speed -> {}", self.day_night.time_speed.label());
+                                    } else if ctrl {
+                                        self.day_night.time_speed = self.day_night.time_speed.slower();
+                                        debug_log!("GameScreen", "on_event",
+                                            "Time speed -> {}", self.day_night.time_speed.label());
+                                    } else {
+                                        // Toggle pause
+                                        use crate::core::lighting::TimeSpeed;
+                                        if self.day_night.time_speed == TimeSpeed::Paused {
+                                            self.day_night.time_speed = TimeSpeed::Normal;
+                                        } else {
+                                            self.day_night.time_speed = TimeSpeed::Paused;
+                                        }
+                                        debug_log!("GameScreen", "on_event",
+                                            "Time speed -> {}", self.day_night.time_speed.label());
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -801,6 +891,7 @@ impl Screen for GameScreen {
     }
 
     fn clear_color(&self) -> wgpu::Color {
-        wgpu::Color { r: 0.55, g: 0.65, b: 0.85, a: 1.0 }
+        let sky = self.day_night.sky_color();
+        wgpu::Color { r: sky[0], g: sky[1], b: sky[2], a: 1.0 }
     }
 }

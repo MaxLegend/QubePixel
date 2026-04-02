@@ -119,65 +119,226 @@ impl Camera {
 }
 
 // ---------------------------------------------------------------------------
-// Vertex3D — position + normal + colour + texcoord (44 bytes)
+// Vertex3D — position + normal + colour + texcoord + ao + material + emission (72 bytes)
 // ---------------------------------------------------------------------------
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex3D {
-    pub position: [f32; 3],
-    pub normal:   [f32; 3],
-    pub color:    [f32; 3],
-    pub texcoord: [f32; 2],
+    pub position: [f32; 3],   // 12 bytes | location 0
+    pub normal:   [f32; 3],   // 12 bytes | location 1
+    pub color:    [f32; 3],   // 12 bytes | location 2  (albedo tint)
+    pub texcoord: [f32; 2],   // 8  bytes | location 3
+    pub ao:       f32,        // 4  bytes | location 4  vertex AO [0..1]
+    pub material: [f32; 2],   // 8  bytes | location 5  [roughness, metalness]
+    pub emission: [f32; 4],   // 16 bytes | location 6  [r, g, b, intensity]
+    pub sky_light: f32,       // 4  bytes | location 7  sky visibility [0..1]
+}
+
+impl Default for Vertex3D {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            normal:   [0.0, 1.0, 0.0],
+            color:    [1.0; 3],
+            texcoord: [0.0; 2],
+            ao:       1.0,
+            material: [0.9, 0.0],
+            emission: [0.0; 4],
+            sky_light: 1.0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// WGSL shaders
+// WGSL shaders — PBR Cook-Torrance with day/night, shadows, emission
 // ---------------------------------------------------------------------------
 const SHADER_SOURCE: &str = r"
+// ===== Uniform layout (272 bytes = 68 floats) =====
 struct Uniforms {
-    view_proj:  mat4x4<f32>,
-    light_dir:  vec4<f32>,
-    camera_pos: vec4<f32>,
+    view_proj:      mat4x4<f32>,   // [0..16]
+    camera_pos:     vec4<f32>,     // [16..20]
+    sun_direction:  vec4<f32>,     // [20..24]  w = intensity
+    sun_color:      vec4<f32>,     // [24..28]
+    moon_direction: vec4<f32>,     // [28..32]  w = intensity
+    moon_color:     vec4<f32>,     // [32..36]
+    ambient_color:  vec4<f32>,     // [36..40]  w = min_level
+    shadow_params:  vec4<f32>,     // [40..44]  bias, enabled, cascades, map_size
+    ssao_params:    vec4<f32>,     // [44..48]  enabled, radius, bias, kernel_size
+    time_params:    vec4<f32>,     // [48..52]  time_of_day, speed_mult, 0, 0
+    shadow_view_proj: mat4x4<f32>, // [52..68]
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var atlas_tex:     texture_2d<f32>;
-@group(0) @binding(2) var atlas_sampler: sampler;
+@group(0) @binding(1) var atlas_tex:      texture_2d<f32>;
+@group(0) @binding(2) var atlas_sampler:  sampler;
+@group(0) @binding(3) var shadow_map:     texture_depth_2d;
+@group(0) @binding(4) var shadow_sampler: sampler_comparison;
 
 struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) normal:   vec3<f32>,
-    @location(2) color:    vec3<f32>,
-    @location(3) texcoord: vec2<f32>,
+    @location(0) position:  vec3<f32>,
+    @location(1) normal:    vec3<f32>,
+    @location(2) color:     vec3<f32>,
+    @location(3) texcoord:  vec2<f32>,
+    @location(4) ao:        f32,
+    @location(5) material:  vec2<f32>,   // roughness, metalness
+    @location(6) emission:  vec4<f32>,   // r, g, b, intensity
+    @location(7) sky_light: f32,         // 1 = open sky, 0 = underground
 };
+
 struct VertexOutput {
-    @builtin(position) clip_pos:    vec4<f32>,
-    @location(0)       v_normal:    vec3<f32>,
-    @location(1)       v_color:     vec3<f32>,
-    @location(2)       v_world_pos: vec3<f32>,
-    @location(3)       v_texcoord:  vec2<f32>,
+    @builtin(position) clip_pos:     vec4<f32>,
+    @location(0)       v_normal:     vec3<f32>,
+    @location(1)       v_color:      vec3<f32>,
+    @location(2)       v_world_pos:  vec3<f32>,
+    @location(3)       v_texcoord:   vec2<f32>,
+    @location(4)       v_ao:         f32,
+    @location(5)       v_material:   vec2<f32>,
+    @location(6)       v_emission:   vec4<f32>,
+    @location(7)       v_shadow_pos: vec4<f32>,
+    @location(8)       v_sky_light:  f32,
 };
 
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_pos    = u.view_proj * vec4<f32>(input.position, 1.0);
-    out.v_normal    = input.normal;
-    out.v_color     = input.color;
-    out.v_world_pos = input.position;
-    out.v_texcoord  = input.texcoord;
+    out.clip_pos     = u.view_proj * vec4<f32>(input.position, 1.0);
+    out.v_normal     = input.normal;
+    out.v_color      = input.color;
+    out.v_world_pos  = input.position;
+    out.v_texcoord   = input.texcoord;
+    out.v_ao         = input.ao;
+    out.v_material   = input.material;
+    out.v_emission   = input.emission;
+    out.v_shadow_pos = u.shadow_view_proj * vec4<f32>(input.position, 1.0);
+    out.v_sky_light  = input.sky_light;
     return out;
+}
+
+const PI: f32 = 3.14159265;
+
+fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
+    let a  = roughness * roughness;
+    let a2 = a * a;
+    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom + 0.0001);
+}
+
+fn geometry_schlick_ggx(n_dot_v: f32, roughness: f32) -> f32 {
+    let r = roughness + 1.0;
+    let k = (r * r) / 8.0;
+    return n_dot_v / (n_dot_v * (1.0 - k) + k + 0.0001);
+}
+
+fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
+    return geometry_schlick_ggx(n_dot_v, roughness)
+         * geometry_schlick_ggx(n_dot_l, roughness);
+}
+
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+}
+
+fn compute_pbr_light(
+    N: vec3<f32>, V: vec3<f32>, L: vec3<f32>,
+    light_color: vec3<f32>,
+    albedo: vec3<f32>, f0: vec3<f32>,
+    roughness: f32, metalness: f32,
+) -> vec3<f32> {
+    let H = normalize(V + L);
+    let n_dot_l = max(dot(N, L), 0.0);
+    let n_dot_v = max(dot(N, V), 0.001);
+    let n_dot_h = max(dot(N, H), 0.0);
+    let h_dot_v = max(dot(H, V), 0.0);
+
+    let D = distribution_ggx(n_dot_h, roughness);
+    let G = geometry_smith(n_dot_v, n_dot_l, roughness);
+    let F = fresnel_schlick(h_dot_v, f0);
+
+    let specular = (D * G * F) / (4.0 * n_dot_v * n_dot_l + 0.0001);
+    let kD = (vec3<f32>(1.0) - F) * (1.0 - metalness);
+    let diffuse = kD * albedo / PI;
+
+    return (diffuse + specular) * light_color * n_dot_l;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let tex_color  = textureSample(atlas_tex, atlas_sampler, input.v_texcoord).rgb;
-    let base_color = input.v_color * tex_color;
-    let light_dir  = normalize(u.light_dir.xyz);
-    let ambient    = 0.35;
-    let diffuse    = max(dot(normalize(input.v_normal), light_dir), 0.0);
-    let light      = ambient + diffuse * 0.65 * u.light_dir.w;
-    return vec4<f32>(base_color * light, 1.0);
+    let tex_color = textureSample(atlas_tex, atlas_sampler, input.v_texcoord).rgb;
+    let albedo    = input.v_color * tex_color;
+
+    let N = normalize(input.v_normal);
+    let V = normalize(u.camera_pos.xyz - input.v_world_pos);
+
+    let roughness  = input.v_material.x;
+    let metalness  = input.v_material.y;
+    let vertex_ao  = input.v_ao;
+    let sky_light  = input.v_sky_light;
+
+    let f0 = mix(vec3<f32>(0.04), albedo, metalness);
+
+    var lo = vec3<f32>(0.0);
+
+    // --- Sun light — only reaches blocks that can see the sky ---
+    let sun_intensity = u.sun_direction.w * sky_light;
+    if (sun_intensity > 0.001) {
+        let sun_L       = normalize(u.sun_direction.xyz);
+        let sun_radiance = u.sun_color.rgb * sun_intensity;
+
+        let shadow_pos = input.v_shadow_pos.xyz / input.v_shadow_pos.w;
+        let shadow_uv  = vec2<f32>(
+            shadow_pos.x * 0.5 + 0.5,
+           -shadow_pos.y * 0.5 + 0.5
+        );
+        var shadow = 1.0;
+        if (shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
+            shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
+            shadow_pos.z <= 1.0 && shadow_pos.z >= 0.0) {
+            shadow = textureSampleCompareLevel(
+                shadow_map, shadow_sampler,
+                shadow_uv, shadow_pos.z - u.shadow_params.x
+            );
+        }
+        let pbr_light = compute_pbr_light(N, V, sun_L, sun_radiance, albedo, f0, roughness, metalness);
+        lo += pbr_light * shadow;
+    }
+
+    // --- Moon light — only reaches blocks that can see the sky ---
+    let moon_intensity = u.moon_direction.w * sky_light;
+    if (moon_intensity > 0.001) {
+        let moon_L       = normalize(u.moon_direction.xyz);
+        let moon_radiance = u.moon_color.rgb * moon_intensity;
+        lo += compute_pbr_light(N, V, moon_L, moon_radiance, albedo, f0, roughness, metalness);
+    }
+
+    // --- Ambient — always applied (provides base underground visibility) ---
+
+    // Blocks under ground receive only a fraction of ambient (cave darkness).
+    let underground_factor = 0.15;
+    let ambient_sky = mix(underground_factor, 1.0, sky_light);
+    let ambient = u.ambient_color.rgb * albedo * vertex_ao * ambient_sky;
+
+    // --- Emission ---
+    let emission = input.v_emission.rgb * input.v_emission.w;
+
+    // --- Combine ---
+    var color = ambient + lo + emission;
+
+    // Exposure
+    color = color * 0.95;
+
+    // ACES filmic tone mapping (Hill approximation)
+    let aces_a = vec3<f32>(2.51);
+    let aces_b = vec3<f32>(0.03);
+    let aces_c = vec3<f32>(2.43);
+    let aces_d = vec3<f32>(0.59);
+    let aces_e = vec3<f32>(0.14);
+    color = clamp(
+        (color * (aces_a * color + aces_b)) / (color * (aces_c * color + aces_d) + aces_e),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+
+    return vec4<f32>(color, 1.0);
 }
 ";
 
@@ -236,9 +397,15 @@ pub struct Game3DPipeline {
     outline_vb:                 Option<wgpu::Buffer>,
     surface_format:             wgpu::TextureFormat,
     cached_bind_group:          Option<wgpu::BindGroup>,
+    shadow_texture:             Option<wgpu::Texture>,
+    shadow_view:                Option<wgpu::TextureView>,
+    shadow_sampler:             Option<wgpu::Sampler>,
+    shadow_pipeline:            wgpu::RenderPipeline,
+    shadow_bind_group:          wgpu::BindGroup,
 }
 
-const UNIFORM_SIZE: u64 = 96;
+/// Uniform buffer size — 272 bytes (68 floats)
+const UNIFORM_SIZE: u64 = 272;
 
 impl Game3DPipeline {
     pub fn new(
@@ -263,7 +430,7 @@ impl Game3DPipeline {
                         ty: wgpu::BindingType::Buffer {
                             ty:                 wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size:   std::num::NonZeroU64::new(UNIFORM_SIZE),
+                            min_binding_size:   None,
                         },
                         count: None,
                     },
@@ -283,6 +450,22 @@ impl Game3DPipeline {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
                 ],
             },
         );
@@ -300,7 +483,14 @@ impl Game3DPipeline {
             array_stride: std::mem::size_of::<Vertex3D>() as wgpu::BufferAddress,
             step_mode:    wgpu::VertexStepMode::Vertex,
             attributes:   &wgpu::vertex_attr_array![
-                0 => Float32x3, 1 => Float32x3, 2 => Float32x3, 3 => Float32x2,
+                0 => Float32x3,  // position
+                1 => Float32x3,  // normal
+                2 => Float32x3,  // color
+                3 => Float32x2,  // texcoord
+                4 => Float32,    // ao
+                5 => Float32x2,  // material [roughness, metalness]
+                6 => Float32x4,  // emission [r, g, b, intensity]
+                 7 => Float32,    // sky_light [0=underground, 1=open sky]
             ],
         };
 
@@ -338,7 +528,85 @@ impl Game3DPipeline {
                 bias:                wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            // wgpu 22: no multiview field; cache field added
+            cache: None,
+            multiview_mask: None,
+        });
+
+        // Shadow pipeline
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shadow Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(r"
+struct Uniforms {
+    view_proj:      mat4x4<f32>,
+    camera_pos:     vec4<f32>,
+    sun_direction:  vec4<f32>,
+    sun_color:      vec4<f32>,
+    moon_direction: vec4<f32>,
+    moon_color:     vec4<f32>,
+    ambient_color:  vec4<f32>,
+    shadow_params:  vec4<f32>,
+    ssao_params:    vec4<f32>,
+    time_params:    vec4<f32>,
+    shadow_view_proj: mat4x4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@vertex fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return u.shadow_view_proj * vec4<f32>(position, 1.0);
+}
+            ")),
+        });
+
+        let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Shadow BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let shadow_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Shadow Pipeline Layout"),
+            bind_group_layouts: &[Some(&shadow_bgl)],
+            immediate_size: 0,
+        });
+
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Shadow Pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex3D>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Front),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Option::from(true),
+                depth_compare: Option::from(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 0.5,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState::default(),
             cache: None,
             multiview_mask: None,
         });
@@ -348,6 +616,15 @@ impl Game3DPipeline {
             size:               UNIFORM_SIZE,
             usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Shadow Bind Group"),
+            layout: &shadow_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
         });
 
         debug_log!("Game3DPipeline", "new", "Pipeline created");
@@ -370,6 +647,11 @@ impl Game3DPipeline {
             outline_vb:                None,
             surface_format:            format,
             cached_bind_group:         None,
+            shadow_texture:            None,
+            shadow_view:               None,
+            shadow_sampler:            None,
+            shadow_pipeline,
+            shadow_bind_group,
         }
     }
 
@@ -589,14 +871,15 @@ impl Game3DPipeline {
 
     pub fn render(
         &mut self,
-        encoder:    &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView,
-        device:     &wgpu::Device,
-        queue:      &wgpu::Queue,
-        camera:     &Camera,
-        width:      u32,
-        height:     u32,
-        atlas_view: &wgpu::TextureView,
+        encoder:       &mut wgpu::CommandEncoder,
+        color_view:    &wgpu::TextureView,
+        device:        &wgpu::Device,
+        queue:         &wgpu::Queue,
+        camera:        &Camera,
+        width:         u32,
+        height:        u32,
+        atlas_view:    &wgpu::TextureView,
+        lighting_data: &[f32; 68],
     ) -> u128 {
         let t0 = Instant::now();
         self.ensure_depth(device, width, height);
@@ -611,19 +894,38 @@ impl Game3DPipeline {
             }));
             debug_log!("Game3DPipeline", "render", "Atlas sampler created");
         }
+        
+        if self.shadow_texture.is_none() {
+            let shadow_size = 2048;
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Shadow Map"),
+                size: wgpu::Extent3d { width: shadow_size, height: shadow_size, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.shadow_view = Some(tex.create_view(&wgpu::TextureViewDescriptor::default()));
+            self.shadow_texture = Some(tex);
+            self.shadow_sampler = Some(device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("Shadow Map Sampler"),
+                compare: Some(wgpu::CompareFunction::LessEqual),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }));
+        }
 
         let vp      = camera.view_projection_matrix();
         let frustum = FrustumPlanes::from_view_projection(&vp);
 
         // Upload uniforms
-        let mut data = [0.0f32; 24];
-        data[0..16].copy_from_slice(&vp.to_cols_array());
-        data[16..20].copy_from_slice(&[0.45, 0.80, 0.55, 1.0]);
-        data[20..24].copy_from_slice(&[
-            camera.position.x, camera.position.y, camera.position.z, 0.0,
-        ]);
         let uniform_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of::<[f32; 24]>())
+            std::slice::from_raw_parts(
+                lighting_data.as_ptr() as *const u8,
+                std::mem::size_of::<[f32; 68]>()
+            )
         };
         queue.write_buffer(&self.uniform_buffer, 0, uniform_bytes);
 
@@ -649,12 +951,48 @@ impl Game3DPipeline {
                                 self.atlas_sampler.as_ref().unwrap()
                             ),
                         },
+                        wgpu::BindGroupEntry {
+                            binding:  3,
+                            resource: wgpu::BindingResource::TextureView(
+                                self.shadow_view.as_ref().unwrap()
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding:  4,
+                            resource: wgpu::BindingResource::Sampler(
+                                self.shadow_sampler.as_ref().unwrap()
+                            ),
+                        },
                     ],
                 },
             ));
             debug_log!("Game3DPipeline", "render", "Bind group cached");
         }
         let bind_group = self.cached_bind_group.as_ref().unwrap();
+
+        // Shadow pass
+        {
+            let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Shadow Pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: self.shadow_view.as_ref().unwrap(),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            
+            shadow_pass.set_pipeline(&self.shadow_pipeline);
+            shadow_pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+            for mesh in self.chunk_meshes.values() {
+                shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
 
         // Depth clear pass
         {

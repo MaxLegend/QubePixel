@@ -1,14 +1,28 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "id": "grass",
   "display_name": "Grass Block",
   "description": "The surface layer of terrain — green on top, brown on sides",
 
   "color": [0.22, 0.52, 0.14],
 
+  "material": {
+    "albedo":    [0.22, 0.52, 0.14],
+    "roughness": 0.85,
+    "metalness": 0.0,
+    "ao":        1.0
+  },
+
   "solid": true,
   "transparent": false,
   "emit_light": 0,
+
+  "emission": {
+    "emit_light":      false,
+    "light_color":     [1.0, 1.0, 1.0],
+    "light_strength":  0.0,
+    "light_intensity": 0.0
+  },
 
   "faces": {
     "top":    { "color": [1.0, 1.0, 1.0], "texture": "grass_top" },

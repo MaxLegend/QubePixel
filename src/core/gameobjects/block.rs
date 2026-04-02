@@ -52,6 +52,75 @@ pub struct FaceColors {
     pub sides:  Option<FaceOverride>,
 }
 
+// ---------------------------------------------------------------------------
+// MaterialProperties — PBR material parameters
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterialProperties {
+    /// Base albedo colour for PBR (0..1 per channel).
+    #[serde(default = "default_albedo")]
+    pub albedo: [f32; 3],
+    /// Roughness: 0.0 (mirror-smooth) — 1.0 (fully rough).
+    #[serde(default = "default_roughness")]
+    pub roughness: f32,
+    /// Metalness: 0.0 (dielectric) — 1.0 (metal).
+    #[serde(default)]
+    pub metalness: f32,
+    /// Ambient occlusion multiplier: 0.0 (fully occluded) — 1.0 (none).
+    #[serde(default = "default_ao")]
+    pub ao: f32,
+}
+
+impl Default for MaterialProperties {
+    fn default() -> Self {
+        Self {
+            albedo:    [0.5, 0.5, 0.5],
+            roughness: 0.9,
+            metalness: 0.0,
+            ao:        1.0,
+        }
+    }
+}
+
+fn default_albedo()    -> [f32; 3] { [0.5, 0.5, 0.5] }
+fn default_roughness() -> f32      { 0.9 }
+fn default_ao()        -> f32      { 1.0 }
+
+// ---------------------------------------------------------------------------
+// EmissionProperties — light-emitting block parameters
+// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmissionProperties {
+    /// Whether this block emits light at all.
+    #[serde(default)]
+    pub emit_light: bool,
+    /// RGB colour of the emitted light (0..1).
+    #[serde(default = "default_white")]
+    pub light_color: [f32; 3],
+    /// Light strength / radius of influence (0..15).
+    #[serde(default)]
+    pub light_strength: f32,
+    /// Brightness intensity multiplier.
+    #[serde(default)]
+    pub light_intensity: f32,
+}
+
+impl Default for EmissionProperties {
+    fn default() -> Self {
+        Self {
+            emit_light:      false,
+            light_color:     [1.0, 1.0, 1.0],
+            light_strength:  0.0,
+            light_intensity: 0.0,
+        }
+    }
+}
+
+fn default_white() -> [f32; 3] { [1.0, 1.0, 1.0] }
+
+// ---------------------------------------------------------------------------
+// BlockDefinition — deserialised from an individual <id>.json
+// ---------------------------------------------------------------------------
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockDefinition {
     /// Unique string identifier, e.g. "grass", "dirt", "stone".
@@ -81,9 +150,17 @@ pub struct BlockDefinition {
     #[serde(default)]
     pub transparent: bool,
 
-    /// Light emission level (0..15).  0 = no light emitted.
+    /// Legacy light emission level (0..15). Superseded by `emission` block.
     #[serde(default)]
     pub emit_light: u8,
+
+    /// PBR material properties (roughness, metalness, AO).
+    #[serde(default)]
+    pub material: MaterialProperties,
+
+    /// Light emission properties (colour, strength, intensity).
+    #[serde(default)]
+    pub emission: EmissionProperties,
 
     /// Optional per-face colour overrides.
     #[serde(default)]
@@ -322,9 +399,10 @@ impl BlockRegistry {
 
         let default_defs: &[(&str, &str)] = &[
             // (block_id, embedded JSON)
-            ("grass", include_str!("../../../assets/blocks/grass.json")),
-            ("dirt",  include_str!("../../../assets/blocks/dirt.json")),
-            ("stone", include_str!("../../../assets/blocks/stone.json")),
+            ("grass",     include_str!("../../../assets/blocks/grass.json")),
+            ("dirt",      include_str!("../../../assets/blocks/dirt.json")),
+            ("stone",     include_str!("../../../assets/blocks/stone.json")),
+            ("glowstone", include_str!("../../../assets/blocks/glowstone.json")),
         ];
 
         let mut definitions = Vec::with_capacity(registry.blocks.len());

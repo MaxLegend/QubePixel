@@ -1,14 +1,28 @@
 {
-  "format_version": 1,
+  "format_version": 2,
   "id": "stone",
   "display_name": "Stone",
   "description": "Hard rock block found deep underground",
 
   "color": [0.50, 0.50, 0.50],
 
+  "material": {
+    "albedo":    [0.50, 0.50, 0.50],
+    "roughness": 0.75,
+    "metalness": 0.0,
+    "ao":        1.0
+  },
+
   "solid": true,
   "transparent": false,
   "emit_light": 0,
+
+  "emission": {
+    "emit_light":      false,
+    "light_color":     [1.0, 1.0, 1.0],
+    "light_strength":  0.0,
+    "light_intensity": 0.0
+  },
 
   "faces": {
     "top":    { "color": [1.0, 1.0, 1.0], "texture": "stone" },

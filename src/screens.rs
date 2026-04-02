@@ -9,3 +9,4 @@ pub mod settings;
 pub mod profiler_overlay;
 pub mod debug_overlay;
 pub mod gpu_info;
+pub mod sky_renderer;
