@@ -23,7 +23,8 @@ use crate::core::gameobjects::chunk::{Chunk, CHUNK_SIZE};
 use crate::screens::game_3d_pipeline::Vertex3D;
 use crate::core::gameobjects::texture_atlas::TextureAtlasLayout;
 use crate::core::raycast::{dda_raycast, RaycastResult, MAX_RAYCAST_DISTANCE};
-
+use crate::core::radiance_cascades::voxel_tex::VOXEL_TEX_SIZE;
+use crate::core::radiance_cascades::voxel_tex::VoxelTextureBuilder;
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
@@ -465,6 +466,50 @@ impl World {
         }
         self.dirty_boundary_neighbors(cx, cy, cz, lx, ly, lz);
     }
+
+    // -----------------------------------------------------------------------
+    // Radiance Cascades: fill voxel texture from loaded chunks
+    // -----------------------------------------------------------------------
+
+    /// Fill a VoxelTextureBuilder with block IDs from all loaded chunks.
+    ///
+    /// Iterates over the 128³ volume around the camera and writes each block
+    /// into the builder's CPU buffer. The caller should recenter() the builder
+    /// first (so world_to_texel mappings are correct), then upload to GPU.
+    ///
+    /// This is called each frame from GameScreen::render() before RC dispatch.
+    pub fn fill_voxel_texture(&self, builder: &mut VoxelTextureBuilder) {
+        let origin = builder.world_origin();
+        let size = VOXEL_TEX_SIZE as i32;
+        let chunk_size = CHUNK_SIZE as i32;
+
+        for (key, chunk) in &self.chunks {
+            let wx_base = key.0 * chunk_size;
+            let wy_base = key.1 * chunk_size;
+            let wz_base = key.2 * chunk_size;
+
+            // Пропускаем чанки, которые не перекрываются с воксел-текстурой
+            if wx_base + chunk_size <= origin.x || wx_base >= origin.x + size { continue; }
+            if wy_base + chunk_size <= origin.y || wy_base >= origin.y + size { continue; }
+            if wz_base + chunk_size <= origin.z || wz_base >= origin.z + size { continue; }
+
+            for bx in 0..CHUNK_SIZE {
+                for by in 0..CHUNK_SIZE {
+                    for bz in 0..CHUNK_SIZE {
+                        let block_id = chunk.get(bx, by, bz);
+                        if block_id != 0 {
+                            builder.set_block(
+                                wx_base + bx as i32,
+                                wy_base + by as i32,
+                                wz_base + bz as i32,
+                                block_id,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -508,6 +553,7 @@ pub struct WorldResult {
     pub lod_counts: [usize; 3],
     pub dirty_count: usize,
     pub worker_total_us: u128,
+    pub voxel_data: Option<(glam::IVec3, Vec<u16>)>,
 }
 
 pub struct WorldWorker {
@@ -528,7 +574,7 @@ impl WorldWorker {
             .name("world-worker".into())
             .spawn(move || {
                 let mut world = World::new(atlas_layout);
-
+                let mut vox_builder = VoxelTextureBuilder::new();
                 loop {
                     match request_rx.recv() {
                         Ok(WorldRequest::Update {
@@ -598,6 +644,17 @@ impl WorldWorker {
                             } else {
                                 Vec::new()
                             };
+                            // Собираем воксел-снапшот для Radiance Cascades
+                            // Voxel snapshot for RC — only when world changed (reuse persistent builder)
+                            let voxel_data = if has_dirty || has_block_ops {
+                                vox_builder.recenter(camera_pos);
+                                world.fill_voxel_texture(&mut vox_builder);
+                                debug_log!("WorldWorker", "thread", "Voxel texture rebuilt (world changed)");
+                                Some((vox_builder.world_origin(), vox_builder.data().to_vec()))
+                            } else {
+                                None
+                            };
+
 
                             let worker_total_us = t_total.elapsed().as_micros();
                             let lod_counts = world.lod_counts();
@@ -614,6 +671,7 @@ impl WorldWorker {
                                 lod_counts,
                                 dirty_count,
                                 worker_total_us,
+                                voxel_data,
                             });
                         }
                         Ok(WorldRequest::Shutdown) | Err(_) => break,

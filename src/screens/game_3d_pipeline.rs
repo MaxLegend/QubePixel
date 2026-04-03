@@ -152,215 +152,8 @@ impl Default for Vertex3D {
 // ---------------------------------------------------------------------------
 // WGSL shaders — PBR Cook-Torrance with day/night, shadows, emission
 // ---------------------------------------------------------------------------
-const SHADER_SOURCE: &str = r"
-// ===== Uniform layout (272 bytes = 68 floats) =====
-struct Uniforms {
-    view_proj:      mat4x4<f32>,   // [0..16]
-    camera_pos:     vec4<f32>,     // [16..20]
-    sun_direction:  vec4<f32>,     // [20..24]  w = intensity
-    sun_color:      vec4<f32>,     // [24..28]
-    moon_direction: vec4<f32>,     // [28..32]  w = intensity
-    moon_color:     vec4<f32>,     // [32..36]
-    ambient_color:  vec4<f32>,     // [36..40]  w = min_level
-    shadow_params:  vec4<f32>,     // [40..44]  bias, enabled, cascades, map_size
-    ssao_params:    vec4<f32>,     // [44..48]  enabled, radius, bias, kernel_size
-    time_params:    vec4<f32>,     // [48..52]  time_of_day, speed_mult, 0, 0
-    shadow_view_proj: mat4x4<f32>, // [52..68]
-};
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var atlas_tex:      texture_2d<f32>;
-@group(0) @binding(2) var atlas_sampler:  sampler;
-@group(0) @binding(3) var shadow_map:     texture_depth_2d;
-@group(0) @binding(4) var shadow_sampler: sampler_comparison;
-
-struct VertexInput {
-    @location(0) position:  vec3<f32>,
-    @location(1) normal:    vec3<f32>,
-    @location(2) color:     vec3<f32>,
-    @location(3) texcoord:  vec2<f32>,
-    @location(4) ao:        f32,
-    @location(5) material:  vec2<f32>,   // roughness, metalness
-    @location(6) emission:  vec4<f32>,   // r, g, b, intensity
-    @location(7) sky_light: f32,         // 1 = open sky, 0 = underground
-};
-
-struct VertexOutput {
-    @builtin(position) clip_pos:     vec4<f32>,
-    @location(0)       v_normal:     vec3<f32>,
-    @location(1)       v_color:      vec3<f32>,
-    @location(2)       v_world_pos:  vec3<f32>,
-    @location(3)       v_texcoord:   vec2<f32>,
-    @location(4)       v_ao:         f32,
-    @location(5)       v_material:   vec2<f32>,
-    @location(6)       v_emission:   vec4<f32>,
-    @location(7)       v_shadow_pos: vec4<f32>,
-    @location(8)       v_sky_light:  f32,
-};
-
-@vertex
-fn vs_main(input: VertexInput) -> VertexOutput {
-    var out: VertexOutput;
-    out.clip_pos     = u.view_proj * vec4<f32>(input.position, 1.0);
-    out.v_normal     = input.normal;
-    out.v_color      = input.color;
-    out.v_world_pos  = input.position;
-    out.v_texcoord   = input.texcoord;
-    out.v_ao         = input.ao;
-    out.v_material   = input.material;
-    out.v_emission   = input.emission;
-    out.v_shadow_pos = u.shadow_view_proj * vec4<f32>(input.position, 1.0);
-    out.v_sky_light  = input.sky_light;
-    return out;
-}
-
-const PI: f32 = 3.14159265;
-
-fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
-    let a  = roughness * roughness;
-    let a2 = a * a;
-    let denom = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-    return a2 / (PI * denom * denom + 0.0001);
-}
-
-fn geometry_schlick_ggx(n_dot_v: f32, roughness: f32) -> f32 {
-    let r = roughness + 1.0;
-    let k = (r * r) / 8.0;
-    return n_dot_v / (n_dot_v * (1.0 - k) + k + 0.0001);
-}
-
-fn geometry_smith(n_dot_v: f32, n_dot_l: f32, roughness: f32) -> f32 {
-    return geometry_schlick_ggx(n_dot_v, roughness)
-         * geometry_schlick_ggx(n_dot_l, roughness);
-}
-
-fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
-    return f0 + (vec3<f32>(1.0) - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
-}
-
-fn compute_pbr_light(
-    N: vec3<f32>, V: vec3<f32>, L: vec3<f32>,
-    light_color: vec3<f32>,
-    albedo: vec3<f32>, f0: vec3<f32>,
-    roughness: f32, metalness: f32,
-) -> vec3<f32> {
-    let H = normalize(V + L);
-    let n_dot_l = max(dot(N, L), 0.0);
-    let n_dot_v = max(dot(N, V), 0.001);
-    let n_dot_h = max(dot(N, H), 0.0);
-    let h_dot_v = max(dot(H, V), 0.0);
-
-    let D = distribution_ggx(n_dot_h, roughness);
-    let G = geometry_smith(n_dot_v, n_dot_l, roughness);
-    let F = fresnel_schlick(h_dot_v, f0);
-
-    let specular = (D * G * F) / (4.0 * n_dot_v * n_dot_l + 0.0001);
-    let kD = (vec3<f32>(1.0) - F) * (1.0 - metalness);
-    let diffuse = kD * albedo / PI;
-
-    return (diffuse + specular) * light_color * n_dot_l;
-}
-
-@fragment
-fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    let tex_color = textureSample(atlas_tex, atlas_sampler, input.v_texcoord).rgb;
-    let albedo    = input.v_color * tex_color;
-
-    let N = normalize(input.v_normal);
-    let V = normalize(u.camera_pos.xyz - input.v_world_pos);
-
-    let roughness  = input.v_material.x;
-    let metalness  = input.v_material.y;
-    let vertex_ao  = input.v_ao;
-    let sky_light  = input.v_sky_light;
-
-    let f0 = mix(vec3<f32>(0.04), albedo, metalness);
-
-    var lo = vec3<f32>(0.0);
-
-    // --- Sun light — only reaches blocks that can see the sky ---
-    let sun_intensity = u.sun_direction.w * sky_light;
-    if (sun_intensity > 0.001) {
-        let sun_L       = normalize(u.sun_direction.xyz);
-        let sun_radiance = u.sun_color.rgb * sun_intensity;
-
-        let shadow_pos = input.v_shadow_pos.xyz / input.v_shadow_pos.w;
-        let shadow_uv  = vec2<f32>(
-            shadow_pos.x * 0.5 + 0.5,
-           -shadow_pos.y * 0.5 + 0.5
-        );
-        var shadow = 1.0;
-        if (shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 &&
-            shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 &&
-            shadow_pos.z <= 1.0 && shadow_pos.z >= 0.0) {
-            shadow = textureSampleCompareLevel(
-                shadow_map, shadow_sampler,
-                shadow_uv, shadow_pos.z - u.shadow_params.x
-            );
-        }
-        let pbr_light = compute_pbr_light(N, V, sun_L, sun_radiance, albedo, f0, roughness, metalness);
-        lo += pbr_light * shadow;
-    }
-
-    // --- Moon light — only reaches blocks that can see the sky ---
-    let moon_intensity = u.moon_direction.w * sky_light;
-    if (moon_intensity > 0.001) {
-        let moon_L       = normalize(u.moon_direction.xyz);
-        let moon_radiance = u.moon_color.rgb * moon_intensity;
-        lo += compute_pbr_light(N, V, moon_L, moon_radiance, albedo, f0, roughness, metalness);
-    }
-
-    // --- Ambient — always applied (provides base underground visibility) ---
-
-    // Blocks under ground receive only a fraction of ambient (cave darkness).
-    let underground_factor = 0.15;
-    let ambient_sky = mix(underground_factor, 1.0, sky_light);
-    let ambient = u.ambient_color.rgb * albedo * vertex_ao * ambient_sky;
-
-    // --- Emission ---
-    let emission = input.v_emission.rgb * input.v_emission.w;
-
-    // --- Combine ---
-    var color = ambient + lo + emission;
-
-    // Exposure
-    color = color * 0.95;
-
-    // ACES filmic tone mapping (Hill approximation)
-    let aces_a = vec3<f32>(2.51);
-    let aces_b = vec3<f32>(0.03);
-    let aces_c = vec3<f32>(2.43);
-    let aces_d = vec3<f32>(0.59);
-    let aces_e = vec3<f32>(0.14);
-    color = clamp(
-        (color * (aces_a * color + aces_b)) / (color * (aces_c * color + aces_d) + aces_e),
-        vec3<f32>(0.0),
-        vec3<f32>(1.0),
-    );
-
-    return vec4<f32>(color, 1.0);
-}
-";
-
-const OUTLINE_SHADER_SOURCE: &str = r"
-struct OutlineUniforms {
-    view_proj: mat4x4<f32>,
-    block_pos: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> u: OutlineUniforms;
-
-@vertex
-fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    let world_pos = position + u.block_pos.xyz;
-    return u.view_proj * vec4<f32>(world_pos, 1.0);
-}
-
-@fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-}
-";
+const SHADER_SOURCE: &str = include_str!("../core/radiance_cascades/shaders/pbr_lighting.wgsl");
+const OUTLINE_SHADER_SOURCE: &str = include_str!("../core/radiance_cascades/shaders/outline.wgsl");
 
 const OUTLINE_UNIFORM_SIZE: u64 = 80;
 
@@ -402,6 +195,7 @@ pub struct Game3DPipeline {
     shadow_sampler:             Option<wgpu::Sampler>,
     shadow_pipeline:            wgpu::RenderPipeline,
     shadow_bind_group:          wgpu::BindGroup,
+    pub gi_bgl:                     Option<wgpu::BindGroupLayout>,
 }
 
 /// Uniform buffer size — 272 bytes (68 floats)
@@ -412,6 +206,7 @@ impl Game3DPipeline {
         device: &wgpu::Device,
         _queue: &wgpu::Queue,
         format: wgpu::TextureFormat,
+        gi_bgl: Option<&wgpu::BindGroupLayout>,
     ) -> Self {
         debug_log!("Game3DPipeline", "new", "Creating 3D pipeline, format={:?}", format);
 
@@ -470,11 +265,40 @@ impl Game3DPipeline {
             },
         );
 
-        // wgpu 22: PipelineLayoutDescriptor has no push_constant_ranges field
+        let gi_bgl_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label:   Some("GI Sample BGL"),
+                entries: &[
+                    // @group(1) @binding(0) uniform GiSampleParams (32B)
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size:   Some(std::num::NonZeroU64::new(32).unwrap()),
+                        },
+                        count: None,
+                    },
+                    // @group(1) @binding(1) storage<read> C0 intervals
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   None,
+                        },
+                        count: None,
+                    },
+                ],
+            },
+        );
+
         let pipeline_layout = device.create_pipeline_layout(
             &wgpu::PipelineLayoutDescriptor {
                 label:              Some("Game3D Pipeline Layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
+                bind_group_layouts: &[Some(&bind_group_layout), Some(&gi_bgl_layout)],
                 immediate_size: 0,
             },
         );
@@ -652,9 +476,17 @@ struct Uniforms {
             shadow_sampler:            None,
             shadow_pipeline,
             shadow_bind_group,
+            gi_bgl: Some(gi_bgl_layout),
         }
     }
-
+    /// Set the GI bind group layout after RC system is initialized.
+    /// This INVALIDATES the cached bind group and triggers pipeline re-creation.
+    /// For simplicity, we store the BGL reference for future use.
+    pub fn set_gi_bgl(&mut self, bgl: wgpu::BindGroupLayout) {
+        self.gi_bgl = Some(bgl);
+        // Invalidate cached bind group — it was created without GI binding
+        self.cached_bind_group = None;
+    }
     // -----------------------------------------------------------------------
     // Incremental chunk mesh management
     // -----------------------------------------------------------------------
@@ -880,6 +712,7 @@ struct Uniforms {
         height:        u32,
         atlas_view:    &wgpu::TextureView,
         lighting_data: &[f32; 68],
+        gi_bind_group: &wgpu::BindGroup,
     ) -> u128 {
         let t0 = Instant::now();
         self.ensure_depth(device, width, height);
@@ -1047,6 +880,7 @@ struct Uniforms {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);
+        pass.set_bind_group(1, gi_bind_group, &[]);
 
         for mesh in self.chunk_meshes.values() {
             if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) { continue; }

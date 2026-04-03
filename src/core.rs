@@ -14,3 +14,7 @@ pub(crate) mod egui_manager;
 pub(crate) mod upload_worker;
 pub mod lighting;
 
+pub(crate) mod radiance_cascades;
+
+
+

@@ -7,6 +7,7 @@ name = "QubePixel"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bytemuck",
  "egui",
  "egui-wgpu",
  "egui-winit",

@@ -31,7 +31,7 @@ pub struct PlayerController {
     fly_mode:      bool,
 
     // -- Хотбар ---------------------------------------------------------
-    registry:       BlockRegistry,
+    pub registry:       BlockRegistry,
     selected_slot:  usize,
     hotbar_ids:     Vec<u8>,     // numeric id из registry
     hotbar_names:   Vec<String>, // строковый id для отображения

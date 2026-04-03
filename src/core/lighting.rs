@@ -395,6 +395,16 @@ impl DayNightCycle {
     pub fn moon_billboard_offset(&self) -> Vec3 {
         self.moon_direction() * 200.0
     }
+
+    // -----------------------------------------------------------------------
+    // GI helper
+    // -----------------------------------------------------------------------
+
+    /// Overall sky brightness factor (0.0 = full night, 1.0 = noon).
+    /// Used by Radiance Cascades to modulate sky emission intensity.
+    pub fn sky_brightness(&self) -> f32 {
+        self.sun_intensity().clamp(0.0, 1.0)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -297,7 +297,41 @@ impl BlockRegistry {
     pub fn is_empty(&self) -> bool {
         self.definitions.is_empty()
     }
+    // -----------------------------------------------------------------------
+    // Radiance Cascades: optical properties for Block LUT
+    // -----------------------------------------------------------------------
 
+    /// Returns optical properties for a block as (opacity, emission_r, emission_g, emission_b).
+    /// Used by Radiance Cascades to build the Block LUT texture.
+    ///
+    /// - opacity: 1000.0 for solid blocks, 0.0 for air/transparent
+    /// - emission_rgb: pre-multiplied (color * intensity), zero for non-emissive
+    pub fn block_optical_props(&self, block_id: u8) -> Option<(f32, f32, f32, f32)> {
+        let def = self.get(block_id)?;
+        if !def.solid {
+            // Air / transparent blocks: fully transparent
+            return Some((0.0, 0.0, 0.0, 0.0));
+        }
+        let opacity = 1000.0;
+        let (er, eg, eb) = if def.emission.emit_light {
+            (
+                def.emission.light_color[0] * def.emission.light_intensity,
+                def.emission.light_color[1] * def.emission.light_intensity,
+                def.emission.light_color[2] * def.emission.light_intensity,
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        Some((opacity, er, eg, eb))
+    }
+
+    /// Number of block types that emit light.
+    pub fn emissive_count(&self) -> usize {
+        self.definitions
+            .iter()
+            .filter(|d| d.emission.emit_light)
+            .count()
+    }
     // -----------------------------------------------------------------------
     // Filesystem loader
     // -----------------------------------------------------------------------

@@ -25,7 +25,9 @@ use crate::screens::sky_renderer::SkyRenderer;
 use glam::Vec3;
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2, Align2, Rounding};
 use crate::core::config;
-
+use crate::core::radiance_cascades::system::RadianceCascadeSystemGpu;
+use crate::core::radiance_cascades::voxel_tex::fill_lut_from_closure;
+use crate::core::radiance_cascades::types::BlockProperties;
 
 const MAX_GPU_UPLOADS_PER_FRAME: usize = 32;
 
@@ -76,6 +78,12 @@ pub struct GameScreen {
     sky_renderer:    SkyRenderer,
     // -- Transition ----------------------------------------------------------
     pending_action: ScreenAction,
+    // В struct GameScreen:
+    rc_system: Option<RadianceCascadeSystemGpu>,
+    /// Whether the Block LUT has been populated (only needs to happen once).
+    rc_lut_initialized: bool,
+    rc_frame_counter: u32,
+    last_voxel_data: Option<(glam::IVec3, Vec<u16>)>,
 }
 
 impl GameScreen {
@@ -131,8 +139,11 @@ impl GameScreen {
             day_night,
             lighting_config,
             sky_renderer: SkyRenderer::new(),
-
+            rc_system: None,
             pending_action: ScreenAction::None,
+            rc_lut_initialized: false,
+            rc_frame_counter: 0,
+            last_voxel_data: None,
         }
     }
 
@@ -201,8 +212,10 @@ impl Screen for GameScreen {
         );
 
         // Non-blocking receive
-        if let Some(result) = self.world_worker.try_recv_result() {
+        if let Some(mut result) = self.world_worker.try_recv_result() {
             self.target_block = result.raycast_result;
+            // Извлекаем воксел-снапшот для RC (take, чтобы не клонировать)
+            self.last_voxel_data = result.voxel_data.take();
             self.physics_world.sync_chunks(&result.physics_chunks, &result.evicted);
 
             // Capture profiler data from WorldResult
@@ -252,10 +265,19 @@ impl Screen for GameScreen {
         height:  u32,
     ) {
         // Lazy-init
+        // Lazy-init 3D pipeline
         if self.pipeline_3d.is_none() {
-            self.pipeline_3d = Some(Game3DPipeline::new(device, queue, format));
+            self.pipeline_3d = Some(Game3DPipeline::new(device, queue, format, None));
         }
 
+        // Lazy-init Radiance Cascades GPU system
+        if self.rc_system.is_none() {
+            let rc = RadianceCascadeSystemGpu::new(device, queue);
+            debug_log!("GameScreen", "render",
+                "RC GPU system initialized ({:.1} MB estimated)",
+                rc.estimated_gpu_memory() as f64 / (1024.0 * 1024.0));
+            self.rc_system = Some(rc);
+        }
         self.atlas.ensure_gpu(device, queue);
 
         // --- Dispatch world result: eviction + submit to packing worker ---
@@ -359,10 +381,61 @@ impl Screen for GameScreen {
             &self.camera, &self.day_night,
         );
 
+        // ---- Radiance Cascades: throttled GI update ----
+        // RC dispatches every RC_THROTTLE frames — GI changes slowly,
+        // per-frame accuracy is not required and was the main GPU bottleneck.
+        const RC_THROTTLE: u32 = 4;
+        self.rc_frame_counter = self.rc_frame_counter.wrapping_add(1);
+
+        if let Some(ref mut rc) = self.rc_system {
+            rc.recenter(self.camera.position);
+
+            // Upload voxel texture only when world worker sent fresh data
+            if let Some((ref origin, ref data)) = self.last_voxel_data {
+                rc.voxel_builder_mut().set_data_raw(*origin, data.clone());
+                rc.upload_voxel_texture(queue);
+                flow_debug_log!("GameScreen", "render", "Voxel texture uploaded to GPU");
+            }
+
+            // Block LUT — once at startup
+            if !self.rc_lut_initialized {
+                let lut = rc.lut_builder_mut();
+                let registry = &self.player.registry;
+                for id in 1u8..=255 {
+                    if let Some(def) = registry.get(id) {
+                        let props = if def.transparent {
+                            BlockProperties::air()
+                        } else if def.emission.emit_light {
+                            BlockProperties::emissive(
+                                def.emission.light_color[0],
+                                def.emission.light_color[1],
+                                def.emission.light_color[2],
+                                def.emission.light_intensity,
+                            )
+                        } else {
+                            BlockProperties::opaque()
+                        };
+                        lut.set(id, props);
+                    }
+                }
+                rc.upload_block_lut(queue);
+                self.rc_lut_initialized = true;
+                debug_log!("GameScreen", "render", "RC block LUT initialized");
+            }
+
+            // Dispatch RC pipeline only every RC_THROTTLE frames
+            if self.rc_frame_counter % RC_THROTTLE == 0 {
+                let sky_brightness = self.day_night.sky_brightness();
+                rc.dispatch(encoder, queue, sky_brightness);
+                flow_debug_log!("GameScreen", "render",
+            "RC dispatched at frame {}", self.rc_frame_counter);
+            }
+        }
+
         // 3D render — pack lighting uniforms and pass to pipeline
         let atlas_view = self.atlas.texture_view().unwrap();
         let vp = self.camera.view_projection_matrix();
-        
+
         let sun_dir = self.day_night.sun_direction();
         let center = self.camera.position;
         let dist = 100.0;
@@ -383,8 +456,44 @@ impl Screen for GameScreen {
             &self.lighting_config,
             &shadow_view_proj,
         );
+
+        // Создаём fallback bind group только если RC система ещё не инициализирована
+        // (в норме она инициализируется в этом же кадре выше)
+        let fallback_gi_bg: Option<wgpu::BindGroup> = if self.rc_system.is_none() {
+            let bgl = pipeline.gi_bgl.as_ref().unwrap();
+            let dummy_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gi_dummy_uniform"),
+                size: 32,
+                usage: wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: false,
+            });
+            let dummy_storage_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gi_dummy_storage"),
+                size: 48,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("GI Fallback BG"),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: dummy_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: dummy_storage_buf.as_entire_binding() },
+                ],
+            }))
+        } else {
+            None
+        };
+
+        let gi_bg: &wgpu::BindGroup = if let Some(ref rc) = self.rc_system {
+            &rc.gi_bg
+        } else {
+            fallback_gi_bg.as_ref().unwrap()
+        };
+
         let render_us = pipeline.render(
-            encoder, view, device, queue, &self.camera, width, height, atlas_view, &lighting_data,
+            encoder, view, device, queue, &self.camera, width, height,
+            atlas_view, &lighting_data, gi_bg,
         );
 
         // Block outline
