@@ -19,7 +19,9 @@ pub const PLAYER_HALF_H: f32     = 0.9;   // полувысота кубоида
 pub const PLAYER_EYE_OFFSET: f32 = 1.62;  // высота глаз над центром тела
 const PLAYER_JUMP_VEL: f32       = 7.5;
 const PLAYER_SPEED: f32          = 5.0;
-const SPAWN: Vec3 = Vec3::new(8.0, 25.0, 30.0);
+/// Spawn above terrain — surface sits at Y≈128-160 (SURFACE_BASE ± SURFACE_AMP).
+/// Y=250 gives ~3 s of free fall before landing, enough for initial chunk generation.
+const SPAWN: Vec3 = Vec3::new(8.0, 250.0, 30.0);
 const FLY_SPEED: f32 = 12.0;
 // ---------------------------------------------------------------------------
 // PlayerController

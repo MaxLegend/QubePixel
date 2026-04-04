@@ -16,25 +16,50 @@ use std::time::Instant;
 use glam::Vec3;
 use noise::{NoiseFn, Perlin};
 use rayon::prelude::*;
+use rapier3d::prelude::*;
 use crate::{debug_log, flow_debug_log};
 use crate::core::config;
 use crate::core::gameobjects::block::BlockRegistry;
-use crate::core::gameobjects::chunk::{Chunk, CHUNK_SIZE};
+use crate::core::gameobjects::chunk::Chunk;
 use crate::screens::game_3d_pipeline::Vertex3D;
 use crate::core::gameobjects::texture_atlas::TextureAtlasLayout;
 use crate::core::raycast::{dda_raycast, RaycastResult, MAX_RAYCAST_DISTANCE};
-use crate::core::radiance_cascades::voxel_tex::VOXEL_TEX_SIZE;
-use crate::core::radiance_cascades::voxel_tex::VoxelTextureBuilder;
+use crate::core::radiance_cascades::voxel_tex::{VOXEL_TEX_SIZE, VoxelTextureBuilder};
+use crate::core::physics::PhysicsChunkReady;
+
+// ---------------------------------------------------------------------------
+// Voxel dirty-region types (used by WorldResult → GameScreen → RC system)
+// ---------------------------------------------------------------------------
+
+/// One 16³ voxel-texture sub-region to be uploaded to the GPU.
+/// `tx, ty, tz` — texel-space origin (multiple of 16).
+/// `data`       — flat [dx + dy*16 + dz*256] u16 slice, 4096 elements (8 KB).
+pub struct VoxelChunkRegion {
+    pub tx:   u32,
+    pub ty:   u32,
+    pub tz:   u32,
+    pub data: Vec<u16>,
+}
+
+/// Describes what the voxel texture needs on the GPU side this frame.
+pub enum VoxelUpdate {
+    /// Camera crossed a chunk boundary — full 32 MB texture replaced.
+    Full { origin: glam::IVec3, data: Vec<u16> },
+    /// Only the listed chunk regions changed — much cheaper (~N×8 KB).
+    Partial { origin: glam::IVec3, regions: Vec<VoxelChunkRegion> },
+}
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
 
 /// World-space Y at which the noise maps to zero (the "sea level").
-const SURFACE_BASE: f64 = 8.0;
+/// Set to half of the default chunk height (256/2 = 128) so the ground
+/// sits in the middle of the world column.
+const SURFACE_BASE: f64 = 128.0;
 /// Half-amplitude of terrain height variation in blocks.
-const SURFACE_AMP: f64  = 5.0;
+const SURFACE_AMP: f64  = 32.0;
 /// Horizontal scale of the noise (larger = smoother hills).
-const NOISE_SCALE: f64  = 48.0;
+const NOISE_SCALE: f64  = 64.0;
 
 /// Staggered loading — max chunks generated per World::update() call.
 const MAX_CHUNKS_PER_FRAME: usize = 64;
@@ -98,17 +123,21 @@ impl World {
         stone_id: u8,
         cx: i32, cy: i32, cz: i32,
     ) -> Chunk {
+        let sx = config::chunk_size_x();
+        let sy = config::chunk_size_y();
+        let sz = config::chunk_size_z();
+
         let mut chunk = Chunk::new(cx, cy, cz);
         chunk.mesh_dirty = true;
 
-        for bx in 0..CHUNK_SIZE {
-            for bz in 0..CHUNK_SIZE {
-                let wx = cx * CHUNK_SIZE as i32 + bx as i32;
-                let wz = cz * CHUNK_SIZE as i32 + bz as i32;
+        for bx in 0..sx {
+            for bz in 0..sz {
+                let wx = cx * sx as i32 + bx as i32;
+                let wz = cz * sz as i32 + bz as i32;
                 let surface = Self::surface_height_fn(noise, wx, wz);
 
-                for by in 0..CHUNK_SIZE {
-                    let wy = cy * CHUNK_SIZE as i32 + by as i32;
+                for by in 0..sy {
+                    let wy = cy * sy as i32 + by as i32;
                     let id = if wy > surface {
                         0
                     } else if wy == surface {
@@ -142,9 +171,9 @@ impl World {
         let v_above = config::vertical_above();
         let rd_sq   = rd * rd;
 
-        let cam_cx = (camera_pos.x / CHUNK_SIZE as f32).floor() as i32;
-        let cam_cy = (camera_pos.y / CHUNK_SIZE as f32).floor() as i32;
-        let cam_cz = (camera_pos.z / CHUNK_SIZE as f32).floor() as i32;
+        let cam_cx = (camera_pos.x / config::chunk_size_x() as f32).floor() as i32;
+        let cam_cy = (camera_pos.y / config::chunk_size_y() as f32).floor() as i32;
+        let cam_cz = (camera_pos.z / config::chunk_size_z() as f32).floor() as i32;
 
         // --- Camera forward projected onto XZ plane (for priority sorting) ---
         let fwd_xz_len = (camera_forward.x * camera_forward.x
@@ -301,8 +330,8 @@ impl World {
     ) -> (Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])>, u128, usize) {
         let t0 = Instant::now();
 
-        let cam_cx = (camera_pos.x / CHUNK_SIZE as f32).floor() as i32;
-        let cam_cz = (camera_pos.z / CHUNK_SIZE as f32).floor() as i32;
+        let cam_cx = (camera_pos.x / config::chunk_size_x() as f32).floor() as i32;
+        let cam_cz = (camera_pos.z / config::chunk_size_z() as f32).floor() as i32;
 
         // Camera forward on XZ plane
         let fwd_xz = {
@@ -351,7 +380,9 @@ impl World {
         let registry = &self.registry;
         let atlas    = &self.atlas_layout;
         let lod_map  = &self.chunk_lod;
-        let cs       = CHUNK_SIZE as i32;
+        let csx = config::chunk_size_x() as i32;
+        let csy = config::chunk_size_y() as i32;
+        let csz = config::chunk_size_z() as i32;
 
         let result: Vec<((i32, i32, i32), Vec<Vertex3D>, Vec<u32>, [f32; 3], [f32; 3])> = dirty_keys
             .into_par_iter()
@@ -364,22 +395,25 @@ impl World {
                 let lod = lod_map.get(&key).copied().unwrap_or(0);
 
                 let get_neighbor = |wx: i32, wy: i32, wz: i32| -> u8 {
-                    let cx = wx.div_euclid(cs);
-                    let cy = wy.div_euclid(cs);
-                    let cz = wz.div_euclid(cs);
-                    let lx = wx.rem_euclid(cs) as usize;
-                    let ly = wy.rem_euclid(cs) as usize;
-                    let lz = wz.rem_euclid(cs) as usize;
+                    let cx = wx.div_euclid(csx);
+                    let cy = wy.div_euclid(csy);
+                    let cz = wz.div_euclid(csz);
+                    let lx = wx.rem_euclid(csx) as usize;
+                    let ly = wy.rem_euclid(csy) as usize;
+                    let lz = wz.rem_euclid(csz) as usize;
                     chunks.get(&(cx, cy, cz))
                         .map_or(0, |c| c.get(lx, ly, lz))
                 };
 
                 let (verts, idxs) = chunk.build_mesh_lod(registry, atlas, get_neighbor, lod);
+
                 if verts.is_empty() { return None; }
 
-                let s   = CHUNK_SIZE as f32;
-                let min = [chunk.cx as f32 * s, chunk.cy as f32 * s, chunk.cz as f32 * s];
-                let max = [min[0] + s, min[1] + s, min[2] + s];
+                let sx = csx as f32;
+                let sy = csy as f32;
+                let sz = csz as f32;
+                let min = [chunk.cx as f32 * sx, chunk.cy as f32 * sy, chunk.cz as f32 * sz];
+                let max = [min[0] + sx, min[1] + sy, min[2] + sz];
                 Some((key, verts, idxs, min, max))
             })
             .collect();
@@ -409,25 +443,96 @@ impl World {
         cx: i32, cy: i32, cz: i32,
         lx: usize, ly: usize, lz: usize,
     ) {
-        if lx == 0                 { self.mark_dirty(cx - 1, cy, cz); }
-        if lx == CHUNK_SIZE - 1    { self.mark_dirty(cx + 1, cy, cz); }
-        if ly == 0                 { self.mark_dirty(cx, cy - 1, cz); }
-        if ly == CHUNK_SIZE - 1    { self.mark_dirty(cx, cy + 1, cz); }
-        if lz == 0                 { self.mark_dirty(cx, cy, cz - 1); }
-        if lz == CHUNK_SIZE - 1    { self.mark_dirty(cx, cy, cz + 1); }
+        let sx = config::chunk_size_x();
+        let sy = config::chunk_size_y();
+        let sz = config::chunk_size_z();
+        if lx == 0      { self.mark_dirty(cx - 1, cy, cz); }
+        if lx == sx - 1 { self.mark_dirty(cx + 1, cy, cz); }
+        if ly == 0      { self.mark_dirty(cx, cy - 1, cz); }
+        if ly == sy - 1 { self.mark_dirty(cx, cy + 1, cz); }
+        if lz == 0      { self.mark_dirty(cx, cy, cz - 1); }
+        if lz == sz - 1 { self.mark_dirty(cx, cy, cz + 1); }
     }
 
     pub fn chunk_count(&self) -> usize { self.chunks.len() }
     pub fn lod_counts(&self) -> [usize; 3] { self.last_lod_counts }
+    // -----------------------------------------------------------------------
+    // Volumetric light: scan nearby chunks for emissive blocks
+    // -----------------------------------------------------------------------
+
+    /// Scan chunks within `radius` world-blocks of `camera_pos` for blocks
+    /// whose emission is set. Returns at most `max_count` results.
+    ///
+    /// Called by WorldWorker when `has_dirty` — updates the per-frame emissive
+    /// block list used by the volumetric light pass.
+    pub fn scan_emissive_blocks(
+        &self,
+        camera_pos: Vec3,
+        radius:     i32,
+        max_count:  usize,
+    ) -> Vec<EmissiveBlockPos> {
+        let mut result = Vec::new();
+        let radius_sq  = radius * radius;
+        let cam_wx = camera_pos.x.floor() as i32;
+        let cam_wy = camera_pos.y.floor() as i32;
+        let cam_wz = camera_pos.z.floor() as i32;
+
+        let csx       = config::chunk_size_x() as i32;
+        let csy       = config::chunk_size_y() as i32;
+        let csz       = config::chunk_size_z() as i32;
+        let r_chunks  = (radius / csx) + 1;
+        let cam_cx    = cam_wx.div_euclid(csx);
+        let cam_cy    = cam_wy.div_euclid(csy);
+        let cam_cz    = cam_wz.div_euclid(csz);
+
+        'outer: for dcx in -r_chunks..=r_chunks {
+            for dcy in -r_chunks..=r_chunks {
+                for dcz in -r_chunks..=r_chunks {
+                    let key = (cam_cx + dcx, cam_cy + dcy, cam_cz + dcz);
+                    if let Some(chunk) = self.chunks.get(&key) {
+                        let wx_base = key.0 * csx;
+                        let wy_base = key.1 * csy;
+                        let wz_base = key.2 * csz;
+                        for bx in 0..config::chunk_size_x() {
+                            for by in 0..config::chunk_size_y() {
+                                for bz in 0..config::chunk_size_z() {
+                                    let block_id = chunk.get(bx, by, bz);
+                                    if block_id == 0 { continue; }
+                                    if let Some(def) = self.registry.get(block_id) {
+                                        if !def.emission.emit_light { continue; }
+                                        let wx = wx_base + bx as i32;
+                                        let wy = wy_base + by as i32;
+                                        let wz = wz_base + bz as i32;
+                                        let dx = wx - cam_wx;
+                                        let dy = wy - cam_wy;
+                                        let dz = wz - cam_wz;
+                                        if dx*dx + dy*dy + dz*dz > radius_sq { continue; }
+                                        result.push(EmissiveBlockPos {
+                                            wx: wx as f32 + 0.5,
+                                            wy: wy as f32 + 0.5,
+                                            wz: wz as f32 + 0.5,
+                                            block_id,
+                                        });
+                                        if result.len() >= max_count { break 'outer; }
+                                    }
+                                }}}
+                    }
+                }}}
+        result
+    }
 
     pub fn get_block(&self, wx: i32, wy: i32, wz: i32) -> u8 {
-        let cs = CHUNK_SIZE as i32;
-        let cx = wx.div_euclid(cs);
-        let cy = wy.div_euclid(cs);
-        let cz = wz.div_euclid(cs);
-        let lx = wx.rem_euclid(cs) as usize;
-        let ly = wy.rem_euclid(cs) as usize;
-        let lz = wz.rem_euclid(cs) as usize;
+        let (csx, csy, csz) = (
+            config::chunk_size_x() as i32,
+            config::chunk_size_y() as i32,
+            config::chunk_size_z() as i32,
+        );
+        let cx = wx.div_euclid(csx);
+        let cy = wy.div_euclid(csy);
+        let cz = wz.div_euclid(csz);
+        let lx = wx.rem_euclid(csx) as usize;
+        let ly = wy.rem_euclid(csy) as usize;
+        let lz = wz.rem_euclid(csz) as usize;
         match self.chunks.get(&(cx, cy, cz)) {
             Some(chunk) => chunk.get(lx, ly, lz),
             None => 0,
@@ -435,13 +540,17 @@ impl World {
     }
 
     pub fn remove_block(&mut self, wx: i32, wy: i32, wz: i32) {
-        let cs = CHUNK_SIZE as i32;
-        let cx = wx.div_euclid(cs);
-        let cy = wy.div_euclid(cs);
-        let cz = wz.div_euclid(cs);
-        let lx = wx.rem_euclid(cs) as usize;
-        let ly = wy.rem_euclid(cs) as usize;
-        let lz = wz.rem_euclid(cs) as usize;
+        let (csx, csy, csz) = (
+            config::chunk_size_x() as i32,
+            config::chunk_size_y() as i32,
+            config::chunk_size_z() as i32,
+        );
+        let cx = wx.div_euclid(csx);
+        let cy = wy.div_euclid(csy);
+        let cz = wz.div_euclid(csz);
+        let lx = wx.rem_euclid(csx) as usize;
+        let ly = wy.rem_euclid(csy) as usize;
+        let lz = wz.rem_euclid(csz) as usize;
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
             chunk.set(lx, ly, lz, 0);
@@ -452,13 +561,17 @@ impl World {
 
     pub fn place_block(&mut self, wx: i32, wy: i32, wz: i32, block_id: u8) {
         if block_id == 0 { return; }
-        let cs = CHUNK_SIZE as i32;
-        let cx = wx.div_euclid(cs);
-        let cy = wy.div_euclid(cs);
-        let cz = wz.div_euclid(cs);
-        let lx = wx.rem_euclid(cs) as usize;
-        let ly = wy.rem_euclid(cs) as usize;
-        let lz = wz.rem_euclid(cs) as usize;
+        let (csx, csy, csz) = (
+            config::chunk_size_x() as i32,
+            config::chunk_size_y() as i32,
+            config::chunk_size_z() as i32,
+        );
+        let cx = wx.div_euclid(csx);
+        let cy = wy.div_euclid(csy);
+        let cz = wz.div_euclid(csz);
+        let lx = wx.rem_euclid(csx) as usize;
+        let ly = wy.rem_euclid(csy) as usize;
+        let lz = wz.rem_euclid(csz) as usize;
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy, cz)) {
             chunk.set(lx, ly, lz, block_id);
@@ -480,31 +593,31 @@ impl World {
     /// This is called each frame from GameScreen::render() before RC dispatch.
     pub fn fill_voxel_texture(&self, builder: &mut VoxelTextureBuilder) {
         let origin = builder.world_origin();
-        let size = VOXEL_TEX_SIZE as i32;
-        let chunk_size = CHUNK_SIZE as i32;
+        let size   = VOXEL_TEX_SIZE as i32;
+        let csx    = config::chunk_size_x() as i32;
+        let csy    = config::chunk_size_y() as i32;
+        let csz    = config::chunk_size_z() as i32;
 
         for (key, chunk) in &self.chunks {
-            let wx_base = key.0 * chunk_size;
-            let wy_base = key.1 * chunk_size;
-            let wz_base = key.2 * chunk_size;
+            let wx_base = key.0 * csx;
+            let wy_base = key.1 * csy;
+            let wz_base = key.2 * csz;
 
-            // Пропускаем чанки, которые не перекрываются с воксел-текстурой
-            if wx_base + chunk_size <= origin.x || wx_base >= origin.x + size { continue; }
-            if wy_base + chunk_size <= origin.y || wy_base >= origin.y + size { continue; }
-            if wz_base + chunk_size <= origin.z || wz_base >= origin.z + size { continue; }
+            // Skip chunks that don't overlap the voxel texture
+            if wx_base + csx <= origin.x || wx_base >= origin.x + size { continue; }
+            if wy_base + csy <= origin.y || wy_base >= origin.y + size { continue; }
+            if wz_base + csz <= origin.z || wz_base >= origin.z + size { continue; }
 
-            for bx in 0..CHUNK_SIZE {
-                for by in 0..CHUNK_SIZE {
-                    for bz in 0..CHUNK_SIZE {
+            for bx in 0..config::chunk_size_x() {
+                for by in 0..config::chunk_size_y() {
+                    for bz in 0..config::chunk_size_z() {
                         let block_id = chunk.get(bx, by, bz);
-                        if block_id != 0 {
-                            builder.set_block(
-                                wx_base + bx as i32,
-                                wy_base + by as i32,
-                                wz_base + bz as i32,
-                                block_id,
-                            );
-                        }
+                        builder.set_block(
+                            wx_base + bx as i32,
+                            wy_base + by as i32,
+                            wz_base + bz as i32,
+                            block_id,
+                        );
                     }
                 }
             }
@@ -518,22 +631,24 @@ impl World {
 
 enum WorldRequest {
     Update {
-        camera_pos:     Vec3,
-        camera_forward: Vec3,
-        ray_dir:        Option<Vec3>,
-        block_ops:      Vec<BlockOp>,
+        camera_pos:        Vec3,
+        camera_forward:    Vec3,
+        ray_dir:           Option<Vec3>,
+        block_ops:         Vec<BlockOp>,
+        /// Chunks evicted from GPU VRAM — mark dirty so they get re-meshed
+        /// when the camera brings them back into view.
+        force_dirty_keys:  Vec<(i32, i32, i32)>,
     },
     Shutdown,
 }
-
-#[derive(Debug)]
-pub struct ChunkBlockData {
-    pub cx: i32,
-    pub cy: i32,
-    pub cz: i32,
-    pub solid_positions: Vec<[u8; 3]>,
+/// World-space center of an emissive block, used by the volumetric light pass.
+#[derive(Debug, Clone)]
+pub struct EmissiveBlockPos {
+    pub wx: f32,
+    pub wy: f32,
+    pub wz: f32,
+    pub block_id: u8,
 }
-
 #[derive(Debug, Clone)]
 pub enum BlockOp {
     Break { x: i32, y: i32, z: i32 },
@@ -548,21 +663,27 @@ pub struct WorldResult {
     pub mesh_time_us: u128,
     pub pending: usize,
     pub raycast_result: Option<RaycastResult>,
-    pub physics_chunks: Vec<ChunkBlockData>,
+    /// Pre-built physics colliders — compound shapes already constructed off-thread.
+    pub physics_ready: Vec<PhysicsChunkReady>,
     // Profiler data
     pub lod_counts: [usize; 3],
     pub dirty_count: usize,
     pub worker_total_us: u128,
-    pub voxel_data: Option<(glam::IVec3, Vec<u16>)>,
+    pub voxel_data: Option<VoxelUpdate>,
+    /// Emissive blocks near the camera — fed to the volumetric light pass.
+    /// `None` means the list has not changed since last frame.
+    pub emissive_blocks: Option<Vec<EmissiveBlockPos>>,
 }
 
 pub struct WorldWorker {
-    request_tx:   mpsc::Sender<WorldRequest>,
-    result_rx:    mpsc::Receiver<WorldResult>,
-    thread:       Option<thread::JoinHandle<()>>,
-    busy:         bool,
-    last_chunk_count: usize,
-    pending_ops:  Vec<BlockOp>,
+    request_tx:          mpsc::Sender<WorldRequest>,
+    result_rx:           mpsc::Receiver<WorldResult>,
+    thread:              Option<thread::JoinHandle<()>>,
+    busy:                bool,
+    last_chunk_count:    usize,
+    pending_ops:         Vec<BlockOp>,
+    /// Chunk keys evicted from GPU VRAM, buffered until next request_update.
+    pending_force_dirty: Vec<(i32, i32, i32)>,
 }
 
 impl WorldWorker {
@@ -575,6 +696,11 @@ impl WorldWorker {
             .spawn(move || {
                 let mut world = World::new(atlas_layout);
                 let mut vox_builder = VoxelTextureBuilder::new();
+                // Sentinel: force Full rebuild on first dirty frame.
+                let mut vox_known_origin = glam::IVec3::new(i32::MIN, i32::MIN, i32::MIN);
+                // Track last player chunk position for physics rebuild triggers.
+                // (cx, cam_wy_coarse, cz) — coarse Y prevents constant rebuild during walking on flat ground.
+                let mut last_phys_cam: (i32, i32, i32) = (i32::MIN, i32::MIN, i32::MIN);
                 loop {
                     match request_rx.recv() {
                         Ok(WorldRequest::Update {
@@ -582,8 +708,17 @@ impl WorldWorker {
                                camera_forward,
                                ray_dir,
                                block_ops,
+                               force_dirty_keys,
                            }) => {
                             let t_total = Instant::now();
+
+                            // Re-mark GPU-evicted chunks dirty so they get re-meshed
+                            // next time the camera moves near them.
+                            for key in &force_dirty_keys {
+                                if let Some(chunk) = world.chunks.get_mut(key) {
+                                    chunk.mesh_dirty = true;
+                                }
+                            }
 
                             let (changed, evicted, gen_time, pending) =
                                 world.update(camera_pos, camera_forward);
@@ -620,42 +755,210 @@ impl WorldWorker {
                                 )
                             });
 
-                            let physics_chunks: Vec<ChunkBlockData> = if has_dirty {
-                                meshes.iter()
-                                    .filter_map(|(key, verts, _, _, _)| {
-                                        if verts.is_empty() { return None; }
-                                        let chunk = world.chunks.get(key)?;
-                                        let mut solid = Vec::new();
-                                        for x in 0..CHUNK_SIZE {
-                                            for y in 0..CHUNK_SIZE {
-                                                for z in 0..CHUNK_SIZE {
+                            let chunk_sx = config::chunk_size_x() as f32;
+                            let chunk_sy = config::chunk_size_y() as f32;
+                            let chunk_sz = config::chunk_size_z() as f32;
+                            let phys_sx  = config::chunk_size_x();
+                            let phys_sy  = config::chunk_size_y();
+                            let phys_sz  = config::chunk_size_z();
+
+                            // ---------------------------------------------------------------------------
+                            // Physics — proximity scan + compound build (all off main thread).
+                            //
+                            // Only the 5×5 chunk area around the player, Y-sliced to ±PHYSICS_Y_MARGIN.
+                            // On block-op only the single affected chunk is rebuilt (incremental).
+                            // Compound shapes are built here via rayon — main thread just inserts handles.
+                            // ---------------------------------------------------------------------------
+                            const PHYSICS_H_RADIUS: i32 = 2;
+                            const PHYSICS_Y_MARGIN: i32 = 10;
+
+                            let cam_chunk_x = (camera_pos.x / chunk_sx).floor() as i32;
+                            let cam_chunk_z = (camera_pos.z / chunk_sz).floor() as i32;
+                            let cam_cy      = (camera_pos.y / chunk_sy).floor() as i32;
+                            let cam_wy      = camera_pos.y.floor() as i32;
+
+                            let cam_wy_coarse = cam_wy / 4;
+                            let player_moved  = (cam_chunk_x, cam_wy_coarse, cam_chunk_z) != last_phys_cam;
+
+                            // Collect affected chunk keys from block-ops for incremental rebuild
+                            let mut block_op_chunk_keys: Vec<(i32, i32, i32)> = Vec::new();
+                            if has_block_ops {
+                                let csx_i = phys_sx as i32;
+                                let csy_i = phys_sy as i32;
+                                let csz_i = phys_sz as i32;
+                                for op in &block_ops {
+                                    let (wx, wy, wz) = match op {
+                                        BlockOp::Break { x, y, z } => (*x, *y, *z),
+                                        BlockOp::Place { x, y, z, .. } => (*x, *y, *z),
+                                    };
+                                    let key = (
+                                        wx.div_euclid(csx_i),
+                                        wy.div_euclid(csy_i),
+                                        wz.div_euclid(csz_i),
+                                    );
+                                    if !block_op_chunk_keys.contains(&key) {
+                                        block_op_chunk_keys.push(key);
+                                    }
+                                }
+                            }
+
+                            let build_physics = has_dirty || has_block_ops || player_moved;
+
+                            if build_physics {
+                                last_phys_cam = (cam_chunk_x, cam_wy_coarse, cam_chunk_z);
+                            }
+
+                            let v_below = config::vertical_below() as i32;
+                            let v_above = config::vertical_above() as i32;
+
+                            let physics_ready: Vec<PhysicsChunkReady> = if build_physics {
+                                // Decide which chunk keys to scan:
+                                // • incremental (block-op only) → just the affected chunk(s)
+                                // • full → all chunks within PHYSICS_H_RADIUS
+                                let keys_to_build: Vec<(i32, i32, i32)> =
+                                    if !block_op_chunk_keys.is_empty() && !changed && !player_moved {
+                                        // Incremental: only the chunks that were modified
+                                        block_op_chunk_keys.clone()
+                                    } else {
+                                        // Full scan
+                                        let mut keys = Vec::new();
+                                        for dx in -PHYSICS_H_RADIUS..=PHYSICS_H_RADIUS {
+                                            for dz in -PHYSICS_H_RADIUS..=PHYSICS_H_RADIUS {
+                                                for dy in -v_below..=v_above {
+                                                    keys.push((cam_chunk_x + dx, cam_cy + dy, cam_chunk_z + dz));
+                                                }
+                                            }
+                                        }
+                                        keys
+                                    };
+
+                                flow_debug_log!(
+                                    "WorldWorker", "thread",
+                                    "[Physics] rebuild keys={} cam=({},{}) wy={} dirty={} ops={} moved={}",
+                                    keys_to_build.len(), cam_chunk_x, cam_chunk_z, cam_wy,
+                                    has_dirty, has_block_ops, player_moved
+                                );
+
+                                // Build compound shapes in parallel with rayon
+                                keys_to_build.into_par_iter()
+                                    .filter_map(|key| {
+                                        let wy_base = key.1 * phys_sy as i32;
+                                        let y_lo = (cam_wy - PHYSICS_Y_MARGIN - wy_base)
+                                            .max(0) as usize;
+                                        let y_hi = (cam_wy + PHYSICS_Y_MARGIN + 1 - wy_base)
+                                            .min(phys_sy as i32).max(0) as usize;
+                                        if y_lo >= y_hi { return None; }
+
+                                        let chunk = world.chunks.get(&key)?;
+                                        let cuboid = SharedShape::cuboid(0.5, 0.5, 0.5);
+                                        let mut shapes: Vec<(Pose, SharedShape)> = Vec::new();
+                                        for x in 0..phys_sx {
+                                            for y in y_lo..y_hi {
+                                                for z in 0..phys_sz {
                                                     if chunk.get(x, y, z) != 0 {
-                                                        solid.push([x as u8, y as u8, z as u8]);
+                                                        let wx = key.0 as f32 * chunk_sx + x as f32 + 0.5;
+                                                        let wy = key.1 as f32 * chunk_sy + y as f32 + 0.5;
+                                                        let wz = key.2 as f32 * chunk_sz + z as f32 + 0.5;
+                                                        shapes.push((
+                                                            Pose::from_translation(
+                                                                rapier3d::prelude::Vector::new(wx, wy, wz),
+                                                            ),
+                                                            cuboid.clone(),
+                                                        ));
                                                     }
                                                 }
                                             }
                                         }
-                                        Some(ChunkBlockData {
-                                            cx: key.0, cy: key.1, cz: key.2,
-                                            solid_positions: solid,
-                                        })
+                                        if shapes.is_empty() { return None; }
+
+                                        let compound = SharedShape::compound(shapes);
+                                        let collider = ColliderBuilder::new(compound)
+                                            .friction(1.0)
+                                            .restitution(0.0)
+                                            .build();
+                                        Some(PhysicsChunkReady { key, collider })
                                     })
                                     .collect()
                             } else {
                                 Vec::new()
                             };
-                            // Собираем воксел-снапшот для Radiance Cascades
-                            // Voxel snapshot for RC — only when world changed (reuse persistent builder)
+                            // ---- Voxel texture update (Partial vs Full) ----
                             let voxel_data = if has_dirty || has_block_ops {
-                                vox_builder.recenter(camera_pos);
-                                world.fill_voxel_texture(&mut vox_builder);
-                                debug_log!("WorldWorker", "thread", "Voxel texture rebuilt (world changed)");
-                                Some((vox_builder.world_origin(), vox_builder.data().to_vec()))
+                                let origin_changed = vox_builder.recenter(camera_pos);
+
+                                if origin_changed || vox_known_origin != vox_builder.world_origin() {
+                                    // Camera crossed chunk boundary — full rebuild
+                                    world.fill_voxel_texture(&mut vox_builder);
+                                    vox_known_origin = vox_builder.world_origin();
+                                    debug_log!("WorldWorker", "thread", "Voxel FULL rebuild (origin changed)");
+                                    Some(VoxelUpdate::Full {
+                                        origin: vox_builder.world_origin(),
+                                        data:   vox_builder.data().to_vec(),
+                                    })
+                                } else {
+                                    // Origin stable — update only affected sub-regions (~N×8 KB each).
+                                    // Chunks may be taller than 16 blocks (columnar), so we
+                                    // split each chunk into 16×16×16 voxel-texture tiles.
+                                    const VOX_REG: usize = 16;
+                                    let csx = config::chunk_size_x();
+                                    let csy = config::chunk_size_y();
+                                    let csz = config::chunk_size_z();
+                                    let csx_i = csx as i32;
+                                    let csy_i = csy as i32;
+                                    let csz_i = csz as i32;
+                                    let tiles_x = (csx + VOX_REG - 1) / VOX_REG;
+                                    let tiles_y = (csy + VOX_REG - 1) / VOX_REG;
+                                    let tiles_z = (csz + VOX_REG - 1) / VOX_REG;
+
+                                    let mut regions = Vec::new();
+                                    for &(cx, cy, cz) in meshes.iter().map(|(k,_,_,_,_)| k) {
+                                        let wx_base = cx * csx_i;
+                                        let wy_base = cy * csy_i;
+                                        let wz_base = cz * csz_i;
+                                        if let Some(chunk) = world.chunks.get(&(cx, cy, cz)) {
+                                            for ty_i in 0..tiles_y {
+                                                for tx_i in 0..tiles_x {
+                                                    for tz_i in 0..tiles_z {
+                                                        let wx_s = wx_base + (tx_i * VOX_REG) as i32;
+                                                        let wy_s = wy_base + (ty_i * VOX_REG) as i32;
+                                                        let wz_s = wz_base + (tz_i * VOX_REG) as i32;
+                                                        let bx_off = tx_i * VOX_REG;
+                                                        let by_off = ty_i * VOX_REG;
+                                                        let bz_off = tz_i * VOX_REG;
+                                                        if let Some((tx, ty, tz)) = vox_builder.fill_chunk_region_fn(
+                                                            wx_s, wy_s, wz_s,
+                                                            |bx, by, bz| chunk.get(bx + bx_off, by + by_off, bz + bz_off),
+                                                        ) {
+                                                            let data = vox_builder.extract_chunk_region(tx, ty, tz);
+                                                            regions.push(VoxelChunkRegion { tx, ty, tz, data });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    debug_log!("WorldWorker", "thread",
+                                        "Voxel PARTIAL update: {} regions", regions.len());
+                                    if regions.is_empty() { None }
+                                    else {
+                                        Some(VoxelUpdate::Partial {
+                                            origin: vox_builder.world_origin(),
+                                            regions,
+                                        })
+                                    }
+                                }
                             } else {
                                 None
                             };
 
-
+                            // ---- Emissive block scan for volumetric light pass ----
+                            // Only re-scan when the world actually changed (chunk added/removed
+                            // or block op applied).  Radius 48 = 3 chunks from camera.
+                            let emissive_blocks = if has_dirty || has_block_ops {
+                                Some(world.scan_emissive_blocks(camera_pos, 48, 256))
+                            } else {
+                                None
+                            };
                             let worker_total_us = t_total.elapsed().as_micros();
                             let lod_counts = world.lod_counts();
 
@@ -667,11 +970,12 @@ impl WorldWorker {
                                 mesh_time_us: mesh_time,
                                 pending,
                                 raycast_result,
-                                physics_chunks,
+                                physics_ready,
                                 lod_counts,
                                 dirty_count,
                                 worker_total_us,
                                 voxel_data,
+                                emissive_blocks,
                             });
                         }
                         Ok(WorldRequest::Shutdown) | Err(_) => break,
@@ -687,28 +991,33 @@ impl WorldWorker {
             request_tx,
             result_rx,
             thread: Some(handle),
-            busy: false,
-            last_chunk_count: 0,
-            pending_ops: Vec::new(),
+            busy:                false,
+            last_chunk_count:    0,
+            pending_ops:         Vec::new(),
+            pending_force_dirty: Vec::new(),
         }
     }
 
     pub fn request_update(
         &mut self,
-        camera_pos:     Vec3,
-        camera_forward: Vec3,
-        ray_dir:        Option<Vec3>,
-        block_ops:      Vec<BlockOp>,
+        camera_pos:       Vec3,
+        camera_forward:   Vec3,
+        ray_dir:          Option<Vec3>,
+        block_ops:        Vec<BlockOp>,
+        force_dirty_keys: Vec<(i32, i32, i32)>,
     ) {
         self.pending_ops.extend(block_ops);
+        self.pending_force_dirty.extend(force_dirty_keys);
 
         if !self.busy {
-            let ops = std::mem::take(&mut self.pending_ops);
+            let ops         = std::mem::take(&mut self.pending_ops);
+            let dirty_keys  = std::mem::take(&mut self.pending_force_dirty);
             let _ = self.request_tx.send(WorldRequest::Update {
                 camera_pos,
                 camera_forward,
                 ray_dir,
-                block_ops: ops,
+                block_ops:        ops,
+                force_dirty_keys: dirty_keys,
             });
             self.busy = true;
         }

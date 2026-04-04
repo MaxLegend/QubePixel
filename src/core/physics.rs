@@ -3,17 +3,17 @@
 // =============================================================================
 
 use std::collections::HashMap;
-use egui::emath::Real;
 use rapier3d::prelude::*;
 use crate::{debug_log, ext_debug_log, flow_debug_log};
 use glam::Vec3;
-use crate::core::gameobjects::world::ChunkBlockData;
 
 // ---------------------------------------------------------------------------
 // Физические константы уровня мира
 // ---------------------------------------------------------------------------
 const GROUND_CHECK_DIST: f32 = 0.15;
-pub const VOID_Y: f32        = -20.0;
+/// Void boundary — must be well below the deepest possible terrain block (Y=0).
+/// With columnar chunks the world bottom is Y=0, so anything below –64 is void.
+pub const VOID_Y: f32    = -64.0;
 const MAX_PHYSICS_DT: f32    = 1.0 / 20.0;
 // -----------------------------------------------------------------------
 // Управление свойствами тел
@@ -34,6 +34,21 @@ pub(crate) fn to_vector(v: Vec3) -> Vector {
 pub(crate) fn from_vector(v: &Vector) -> Vec3 {
     Vec3::new(v.x, v.y, v.z)
 }
+
+// ---------------------------------------------------------------------------
+// PhysicsChunkReady — pre-built collider, created off-thread
+// ---------------------------------------------------------------------------
+
+/// A chunk collider whose compound shape has already been built on a background
+/// thread.  The main thread only needs to insert it into the collider set.
+pub struct PhysicsChunkReady {
+    pub key:      (i32, i32, i32),
+    pub collider: Collider,
+}
+
+// Safety: Collider is Send because SharedShape is Arc<dyn Shape + Send + Sync>.
+// rapier3d types are Send when not attached to a set.
+unsafe impl Send for PhysicsChunkReady {}
 
 // ---------------------------------------------------------------------------
 // PhysicsWorld — только симуляция и коллайдеры чанков
@@ -194,12 +209,15 @@ impl PhysicsWorld {
         }
     }
     // -----------------------------------------------------------------------
-    // Синхронизация коллайдеров чанков (без изменений)
+    // Синхронизация коллайдеров чанков (insert-only: shapes pre-built off-thread)
     // -----------------------------------------------------------------------
 
-    pub fn sync_chunks(
+    /// Accept pre-built colliders from the world-worker thread.
+    /// Compound shape construction (the expensive O(N log N) BVH) already happened
+    /// on the background thread; here we only insert / remove handles — O(1) each.
+    pub fn sync_chunks_ready(
         &mut self,
-        added:   &[ChunkBlockData],
+        added:   Vec<PhysicsChunkReady>,
         removed: &[(i32, i32, i32)],
     ) {
         for key in removed {
@@ -211,49 +229,28 @@ impl PhysicsWorld {
                     false,
                 );
                 ext_debug_log!(
-                    "PhysicsWorld", "sync_chunks",
+                    "PhysicsWorld", "sync_chunks_ready",
                     "Removed chunk collider ({},{},{})", key.0, key.1, key.2
                 );
             }
         }
 
         let mut added_count = 0u32;
-        for chunk_data in added {
-            if chunk_data.solid_positions.is_empty() { continue; }
-            let key = (chunk_data.cx, chunk_data.cy, chunk_data.cz);
-
-            if let Some(old) = self.chunk_colliders.remove(&key) {
+        for ready in added {
+            if let Some(old) = self.chunk_colliders.remove(&ready.key) {
                 self.collider_set.remove(
                     old, &mut self.island_manager, &mut self.rigid_body_set, false,
                 );
             }
 
-            let cuboid = SharedShape::cuboid(0.5, 0.5, 0.5);
-            let shapes: Vec<(Pose, SharedShape)> = chunk_data
-                .solid_positions
-                .iter()
-                .map(|pos| {
-                    let wx = chunk_data.cx as f32 * 16.0 + pos[0] as f32 + 0.5;
-                    let wy = chunk_data.cy as f32 * 16.0 + pos[1] as f32 + 0.5;
-                    let wz = chunk_data.cz as f32 * 16.0 + pos[2] as f32 + 0.5;
-                    (Pose::from_translation(Vector::new(wx, wy, wz)), cuboid.clone())
-                })
-                .collect();
-
-            let compound = SharedShape::compound(shapes);
-            let collider = ColliderBuilder::new(compound)
-                .friction(1.0)
-                .restitution(0.0)
-                .build();
-
-            let handle = self.collider_set.insert(collider);
-            self.chunk_colliders.insert(key, handle);
+            let handle = self.collider_set.insert(ready.collider);
+            self.chunk_colliders.insert(ready.key, handle);
             added_count += 1;
         }
 
         if added_count > 0 || !removed.is_empty() {
             flow_debug_log!(
-                "PhysicsWorld", "sync_chunks",
+                "PhysicsWorld", "sync_chunks_ready",
                 "Synced: added={} removed={} total={}",
                 added_count, removed.len(), self.chunk_colliders.len()
             );

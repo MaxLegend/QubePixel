@@ -37,26 +37,6 @@ struct RadianceInterval {
 }
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const GOLDEN_ANGLE: f32 = 2.39996323;
-const WORKGROUP_SIZE: u32 = 64u;
-const DIRECTION_PACKING: u32 = 4u; // 4 intervals packed into one vec4 offset
-
-// ---------------------------------------------------------------------------
-// Fibonacci sphere direction (matches CPU fibonacci_direction)
-// ---------------------------------------------------------------------------
-
-fn fibonacci_direction(i: u32, n: u32) -> vec3<f32> {
-    let inv_n = 1.0 / f32(n);
-    let y = 1.0 - 2.0 * (f32(i) + 0.5) * inv_n;
-    let radius = sqrt(max(0.0, 1.0 - y * y));
-    let theta = GOLDEN_ANGLE * f32(i);
-    return vec3<f32>(cos(theta) * radius, y, sin(theta) * radius);
-}
-
-// ---------------------------------------------------------------------------
 // Nearest probe index helper
 // ---------------------------------------------------------------------------
 
@@ -151,13 +131,14 @@ fn sample_gi(
 
         // Transmittance-weighted in-scattered radiance
         // exp(-tau) scales how much light from far away reaches this point
-        let tau = clamp(interval.radiance_out.w, 0.0, 80.0);
-        let transmittance = exp(-tau);
+         let tau = clamp(interval.radiance_out.w, 0.0, 80.0);
+         let transmittance = exp(-tau);
 
-        // Accumulate: in-scattered radiance (bounced light) + emission at far end
-        let bounce_contribution = interval.radiance_in.rgb * cos_weight * solid_angle_weight;
-        let emission_contribution = interval.radiance_out.rgb * transmittance * cos_weight * solid_angle_weight * params.bounce_intensity;
+         let em_tau = clamp(interval.radiance_in.a, 0.0, 80.0);
+         let em_trans = exp(-em_tau);
 
+         let bounce_contribution = interval.radiance_in.rgb * cos_weight * solid_angle_weight;
+         let emission_contribution = interval.radiance_out.rgb * em_trans * cos_weight * solid_angle_weight * params.bounce_intensity;
         gi = gi + bounce_contribution + emission_contribution;
         weight_sum = weight_sum + cos_weight * solid_angle_weight;
     }

@@ -3,7 +3,49 @@
 // =============================================================================
 
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::OnceLock;
+use serde::Deserialize;
 use crate::debug_log;
+
+// ---------------------------------------------------------------------------
+// Chunk dimensions — loaded once from assets/chunk_config.json
+// ---------------------------------------------------------------------------
+
+/// Per-axis chunk size in blocks. Default: 16×256×16 (columnar).
+/// Dimensions should be multiples of 4 so LOD steps (×2, ×4) divide evenly.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ChunkDimensions {
+    pub size_x: usize,
+    pub size_y: usize,
+    pub size_z: usize,
+}
+
+impl Default for ChunkDimensions {
+    fn default() -> Self {
+        Self { size_x: 16, size_y: 256, size_z: 16 }
+    }
+}
+
+static CHUNK_DIMS: OnceLock<ChunkDimensions> = OnceLock::new();
+
+/// Returns the global chunk dimensions, loading from JSON on first call.
+pub fn chunk_dims() -> &'static ChunkDimensions {
+    CHUNK_DIMS.get_or_init(|| {
+        let dims: ChunkDimensions = std::fs::read_to_string("assets/chunk_config.json")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        debug_log!(
+            "Config", "chunk_dims",
+            "Chunk dimensions: {}x{}x{}", dims.size_x, dims.size_y, dims.size_z
+        );
+        dims
+    })
+}
+
+#[inline(always)] pub fn chunk_size_x() -> usize { chunk_dims().size_x }
+#[inline(always)] pub fn chunk_size_y() -> usize { chunk_dims().size_y }
+#[inline(always)] pub fn chunk_size_z() -> usize { chunk_dims().size_z }
 
 /// Render distance in chunks (horizontal). Range: 1..=128.
 pub static RENDER_DISTANCE: AtomicI32 = AtomicI32::new(3);
@@ -19,9 +61,10 @@ pub static LOD_MULTIPLIER: AtomicU32 = AtomicU32::new(100);
 pub const LOD_NEAR_BASE: f32 = 3.0;
 pub const LOD_FAR_BASE: f32  = 6.0;
 /// Vertical chunk loading range — chunks below camera's chunk Y.
-pub static VERTICAL_BELOW: AtomicI32 = AtomicI32::new(2);
+/// Default 0: with 256-height columnar chunks the whole world fits in one vertical layer.
+pub static VERTICAL_BELOW: AtomicI32 = AtomicI32::new(0);
 /// Vertical chunk loading range — chunks above camera's chunk Y.
-pub static VERTICAL_ABOVE: AtomicI32 = AtomicI32::new(3);
+pub static VERTICAL_ABOVE: AtomicI32 = AtomicI32::new(0);
 // ---------------------------------------------------------------------------
 // Render distance
 // ---------------------------------------------------------------------------
@@ -55,21 +98,21 @@ pub fn set_lod_multiplier(v: f32) {
 // ---------------------------------------------------------------------------
 
 pub fn vertical_below() -> i32 {
-    VERTICAL_BELOW.load(Ordering::Relaxed).clamp(1, 16)
+    VERTICAL_BELOW.load(Ordering::Relaxed).clamp(0, 16)
 }
 
 pub fn set_vertical_below(v: i32) {
-    let clamped = v.clamp(1, 16);
+    let clamped = v.clamp(0, 16);
     VERTICAL_BELOW.store(clamped, Ordering::Relaxed);
     debug_log!("Config", "set_vertical_below", "Vertical below set to {}", clamped);
 }
 
 pub fn vertical_above() -> i32 {
-    VERTICAL_ABOVE.load(Ordering::Relaxed).clamp(1, 16)
+    VERTICAL_ABOVE.load(Ordering::Relaxed).clamp(0, 16)
 }
 
 pub fn set_vertical_above(v: i32) {
-    let clamped = v.clamp(1, 16);
+    let clamped = v.clamp(0, 16);
     VERTICAL_ABOVE.store(clamped, Ordering::Relaxed);
     debug_log!("Config", "set_vertical_above", "Vertical above set to {}", clamped);
 }

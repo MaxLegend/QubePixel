@@ -103,6 +103,11 @@ pub struct EmissionProperties {
     /// Brightness intensity multiplier.
     #[serde(default)]
     pub light_intensity: f32,
+    /// If true, this block's surface does not receive GI from nearby emissive
+    /// probes — prevents the block from tinting itself with its own emitted
+    /// colour (e.g. glowstone turning extra-yellow from self-illumination).
+    #[serde(default)]
+    pub no_self_gi: bool,
 }
 
 impl Default for EmissionProperties {
@@ -112,11 +117,82 @@ impl Default for EmissionProperties {
             light_color:     [1.0, 1.0, 1.0],
             light_strength:  0.0,
             light_intensity: 0.0,
+            no_self_gi:      false,
         }
     }
 }
 
 fn default_white() -> [f32; 3] { [1.0, 1.0, 1.0] }
+
+// ---------------------------------------------------------------------------
+// VolumetricProperties — per-block volumetric light / god-ray parameters
+// ---------------------------------------------------------------------------
+
+/// Volumetric glow and god-ray parameters for emissive blocks.
+/// All settings are opt-in: set `halo_enabled` or `ray_enabled` to true.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumetricProperties {
+    /// Enable a soft additive halo (Gaussian sphere) around the block centre.
+    #[serde(default)]
+    pub halo_enabled: bool,
+    /// World-space radius of the halo in blocks (default: 2.5).
+    #[serde(default = "default_halo_radius")]
+    pub halo_radius: f32,
+    /// Peak intensity of the halo (0..1, default: 0.6).
+    #[serde(default = "default_halo_intensity")]
+    pub halo_intensity: f32,
+
+    /// Enable directional god rays radiating outward from the block.
+    #[serde(default)]
+    pub ray_enabled: bool,
+    /// Number of rays emitted (default: 4).
+    #[serde(default = "default_ray_count")]
+    pub ray_count: u32,
+    /// Length of each ray in blocks (default: 6.0).
+    #[serde(default = "default_ray_length")]
+    pub ray_length: f32,
+    /// Width of each ray in blocks (default: 0.4).
+    #[serde(default = "default_ray_width")]
+    pub ray_width: f32,
+    /// Peak intensity of each ray (0..1, default: 0.18).
+    #[serde(default = "default_ray_intensity")]
+    pub ray_intensity: f32,
+    /// Falloff exponent along the ray (higher = sharper fade, default: 2.0).
+    #[serde(default = "default_ray_falloff")]
+    pub ray_falloff: f32,
+}
+
+impl Default for VolumetricProperties {
+    fn default() -> Self {
+        Self {
+            halo_enabled:  false,
+            halo_radius:   default_halo_radius(),
+            halo_intensity: default_halo_intensity(),
+            ray_enabled:   false,
+            ray_count:     default_ray_count(),
+            ray_length:    default_ray_length(),
+            ray_width:     default_ray_width(),
+            ray_intensity: default_ray_intensity(),
+            ray_falloff:   default_ray_falloff(),
+        }
+    }
+}
+
+impl VolumetricProperties {
+    /// Returns true if at least one volumetric effect is enabled.
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.halo_enabled || self.ray_enabled
+    }
+}
+
+fn default_halo_radius()    -> f32 { 2.5 }
+fn default_halo_intensity() -> f32 { 0.6 }
+fn default_ray_count()      -> u32 { 4 }
+fn default_ray_length()     -> f32 { 6.0 }
+fn default_ray_width()      -> f32 { 0.4 }
+fn default_ray_intensity()  -> f32 { 0.18 }
+fn default_ray_falloff()    -> f32 { 2.0 }
 
 // ---------------------------------------------------------------------------
 // BlockDefinition — deserialised from an individual <id>.json
@@ -161,6 +237,10 @@ pub struct BlockDefinition {
     /// Light emission properties (colour, strength, intensity).
     #[serde(default)]
     pub emission: EmissionProperties,
+
+    /// Volumetric glow and god-ray visual effects (opt-in per block).
+    #[serde(default)]
+    pub volumetric: VolumetricProperties,
 
     /// Optional per-face colour overrides.
     #[serde(default)]

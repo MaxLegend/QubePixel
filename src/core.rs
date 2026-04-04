@@ -15,6 +15,7 @@ pub(crate) mod upload_worker;
 pub mod lighting;
 
 pub(crate) mod radiance_cascades;
+pub(crate) mod volumetric_lights;
 
 
 

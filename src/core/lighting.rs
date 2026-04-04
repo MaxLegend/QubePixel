@@ -121,9 +121,9 @@ impl Default for LightingConfig {
             },
             shadows: ShadowConfig {
                 enabled:  true,
-                cascades: 1,
-                map_size: 1024,
-                bias:     0.001,
+                cascades: 8,
+                map_size: 2048,
+                bias:     0.0,
                 distance: 64.0,
             },
             ssao: SsaoConfig {

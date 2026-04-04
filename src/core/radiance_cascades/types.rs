@@ -26,22 +26,29 @@ pub const NUM_CASCADES: usize = 5;
 
 /// Base grid spacing in world units (voxels) for cascade C0.
 /// Each subsequent cascade doubles this: C_i = BASE_SPACING * 2^i.
-pub const BASE_SPACING: f32 = 4.0;
+pub const BASE_SPACING: f32 = 1.0;
 
-/// Base number of rays per probe for cascade C0.
-/// Each subsequent cascade multiplies by BRANCHING_FACTOR.
-pub const BASE_RAYS: u32 = 6;
+/// Cube-face subdivision levels per cascade. Ray count = 6 * subdiv².
+///   C0: subdiv=2 →  24 rays (4 per face; fixes directional aliasing in merge)
+///   C1: subdiv=2 →  24 rays
+///   C2: subdiv=3 →  54 rays
+///   C3: subdiv=4 →  96 rays
+///   C4: subdiv=5 → 150 rays
+pub const CUBE_FACE_SUBDIVS: [u32; 5] = [1, 2, 3, 4, 5];
 
-/// Angular resolution branching factor.
-/// R(i) = BASE_RAYS * BRANCHING_FACTOR^i.
-pub const BRANCHING_FACTOR: u32 = 2;
-
-/// Base grid half-extent (probes from center to edge) for cascade C0.
-/// C0 covers a (2*16+1)^3 = 33^3 probe grid.
+/// Base grid half-extent for cascade C0 (used in tests and as reference).
 pub const BASE_GRID_HALF_EXTENT: u32 = 16;
 
+/// Per-cascade grid half-extents. Coverage = (2×extent+1) × spacing per axis.
+///   C0:  13×1  =  13 blocks   C1:  9×2  =  18 blocks   C2:  9×4  =  36 blocks
+///   C3:   9×8  =  72 blocks   C4:  9×16 = 144 blocks (~9 chunks/side)
+/// C0: subdiv=2 → 24 rays, extent=6 → 13³×24 ≈ 52k/frame
+/// C1: subdiv=2 → 24 rays, extent=4 →  9³×24 ≈ 17k/frame
+/// C0+C1 marched every frame; C2-C4 every 4th frame.
+pub const CASCADE_GRID_HALF_EXTENTS: [u32; 5] = [33, 4, 2, 2, 1];
+
 /// Maximum ray marching steps per ray (prevents infinite loops).
-pub const MAX_RAY_STEPS: u32 = 256;
+pub const MAX_RAY_STEPS: u32 = 128;
 
 /// Opacity threshold above which a block is considered fully opaque.
 /// Used in the compute shader to terminate rays early.
@@ -49,7 +56,7 @@ pub const OPAQUE_THRESHOLD: f32 = 500.0;
 
 /// Single-block ray step (for DDA max distance = cascade spacing).
 /// Rays in cascade C_i travel at most this many voxels.
-pub const RAY_MAX_DIST_FACTOR: f32 = 1.5;
+pub const RAY_MAX_DIST_FACTOR: f32 = 6.0;
 
 // ---------------------------------------------------------------------------
 // CascadeConfig
@@ -118,12 +125,13 @@ pub fn default_cascade_configs() -> [CascadeConfig; NUM_CASCADES] {
     let mut configs = [CascadeConfig::default(); NUM_CASCADES];
 
     let mut cumulative_start = 0.0f32;
-    let mut rays = BASE_RAYS;
-    let mut extent = BASE_GRID_HALF_EXTENT;
 
     for i in 0..NUM_CASCADES {
         let spacing = BASE_SPACING * (1u32 << i) as f32;
         let ray_len = spacing * RAY_MAX_DIST_FACTOR;
+        let subdiv = CUBE_FACE_SUBDIVS[i];
+        let rays = 6 * subdiv * subdiv; // exact cube-face ray count
+        let extent = CASCADE_GRID_HALF_EXTENTS[i];
 
         configs[i] = CascadeConfig {
             level: i as u32,
@@ -135,8 +143,6 @@ pub fn default_cascade_configs() -> [CascadeConfig; NUM_CASCADES] {
         };
 
         cumulative_start += ray_len;
-        rays *= BRANCHING_FACTOR;
-        extent = (extent + 1) / 2; // Halve, rounding up
     }
 
     debug_log!(
@@ -598,35 +604,31 @@ mod tests {
         // Verify cascade count
         assert_eq!(configs.len(), NUM_CASCADES);
 
-        // C0: spacing = 4, rays = 6, extent = 16
+        // C0: spacing=1.0, subdiv=2 → 24 rays, extent=CASCADE_GRID_HALF_EXTENTS[0]
         assert_eq!(configs[0].level, 0);
-        assert!((configs[0].grid_spacing - 4.0).abs() < 1e-6);
-        assert_eq!(configs[0].ray_count, 6);
-        assert_eq!(configs[0].grid_half_extent, 16);
+        assert!((configs[0].grid_spacing - 1.0).abs() < 1e-6);
+        assert_eq!(configs[0].ray_count, 24);  // 6*2*2
+        assert_eq!(configs[0].grid_half_extent, CASCADE_GRID_HALF_EXTENTS[0]);
 
-        // C1: spacing = 8, rays = 12, extent = 8
+        // C1: spacing=2.0, subdiv=2 → 24 rays
         assert_eq!(configs[1].level, 1);
-        assert!((configs[1].grid_spacing - 8.0).abs() < 1e-6);
-        assert_eq!(configs[1].ray_count, 12);
-        assert_eq!(configs[1].grid_half_extent, 8);
+        assert!((configs[1].grid_spacing - 2.0).abs() < 1e-6);
+        assert_eq!(configs[1].ray_count, 24);  // 6*2*2
 
-        // C2: spacing = 16, rays = 24, extent = 4
+        // C2: spacing=4.0, subdiv=3 → 54 rays
         assert_eq!(configs[2].level, 2);
-        assert!((configs[2].grid_spacing - 16.0).abs() < 1e-6);
-        assert_eq!(configs[2].ray_count, 24);
-        assert_eq!(configs[2].grid_half_extent, 4);
+        assert!((configs[2].grid_spacing - 4.0).abs() < 1e-6);
+        assert_eq!(configs[2].ray_count, 54);  // 6*3*3
 
-        // C3: spacing = 32, rays = 48, extent = 2
+        // C3: spacing=8.0, subdiv=4 → 96 rays
         assert_eq!(configs[3].level, 3);
-        assert!((configs[3].grid_spacing - 32.0).abs() < 1e-6);
-        assert_eq!(configs[3].ray_count, 48);
-        assert_eq!(configs[3].grid_half_extent, 2);
+        assert!((configs[3].grid_spacing - 8.0).abs() < 1e-6);
+        assert_eq!(configs[3].ray_count, 96);  // 6*4*4
 
-        // C4: spacing = 64, rays = 96, extent = 1
+        // C4: spacing=16.0, subdiv=5 → 150 rays
         assert_eq!(configs[4].level, 4);
-        assert!((configs[4].grid_spacing - 64.0).abs() < 1e-6);
-        assert_eq!(configs[4].ray_count, 96);
-        assert_eq!(configs[4].grid_half_extent, 1);
+        assert!((configs[4].grid_spacing - 16.0).abs() < 1e-6);
+        assert_eq!(configs[4].ray_count, 150); // 6*5*5
 
         // Ray start increases with each cascade
         for i in 1..NUM_CASCADES {
@@ -641,16 +643,11 @@ mod tests {
     #[test]
     fn test_grid_size() {
         let configs = default_cascade_configs();
-        // C0: 2*16+1 = 33
-        assert_eq!(configs[0].grid_size(), 33);
-        // C1: 2*8+1 = 17
-        assert_eq!(configs[1].grid_size(), 17);
-        // C2: 2*4+1 = 9
-        assert_eq!(configs[2].grid_size(), 9);
-        // C3: 2*2+1 = 5
-        assert_eq!(configs[3].grid_size(), 5);
-        // C4: 2*1+1 = 3
-        assert_eq!(configs[4].grid_size(), 3);
+        // Each cascade uses its per-cascade extent from CASCADE_GRID_HALF_EXTENTS
+        for i in 0..NUM_CASCADES {
+            let expected = CASCADE_GRID_HALF_EXTENTS[i] * 2 + 1;
+            assert_eq!(configs[i].grid_size(), expected);
+        }
     }
 
     #[test]

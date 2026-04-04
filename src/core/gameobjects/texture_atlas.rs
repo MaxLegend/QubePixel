@@ -1,11 +1,13 @@
 // =============================================================================
-// QubePixel — TextureAtlas  (loads PNGs, stitches into atlas, mip-mapped GPU upload)
+// QubePixel — TextureAtlas  (albedo + normal map, stitched atlas, mip-mapped)
 // =============================================================================
 //
 // CHANGELOG:
 //   • Mip-mapping: generates per-tile mip levels (box filter) to prevent
 //     tile bleeding at atlas seams.  Uses trilinear-ready mip chain.
 //   • mip_level_count() exposed for sampler configuration.
+//   • Normal map atlas: parallel atlas loaded from *_n.png files,
+//     falls back to flat normals (128,128,255) per tile.
 // =============================================================================
 
 use std::collections::HashMap;
@@ -56,13 +58,21 @@ impl Default for TextureAtlasLayout {
 // TextureAtlas
 // ---------------------------------------------------------------------------
 pub struct TextureAtlas {
-    /// Base atlas image (mip level 0).
+    /// Base albedo atlas image (mip level 0).
     image:       RgbaImage,
-    /// Pre-computed mip levels 1..N (level 0 = self.image).
+    /// Pre-computed albedo mip levels 1..N (level 0 = self.image).
     mip_images:  Vec<RgbaImage>,
+    /// Normal map atlas image (mip level 0). Same slot layout as albedo.
+    normal_image:       RgbaImage,
+    /// Pre-computed normal mip levels 1..N.
+    normal_mip_images:  Vec<RgbaImage>,
     layout:      TextureAtlasLayout,
+    // -- Albedo GPU --
     gpu_texture: Option<wgpu::Texture>,
     gpu_view:    Option<wgpu::TextureView>,
+    // -- Normal GPU --
+    normal_gpu_texture: Option<wgpu::Texture>,
+    normal_gpu_view:    Option<wgpu::TextureView>,
 }
 
 impl TextureAtlas {
@@ -90,17 +100,18 @@ impl TextureAtlas {
 
     pub fn layout(&self) -> &TextureAtlasLayout { &self.layout }
 
-    /// Upload atlas + mip chain to GPU.
+    /// Upload albedo + normal atlas + mip chains to GPU.
     pub fn ensure_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if self.gpu_texture.is_some() { return; }
 
         debug_log!(
             "TextureAtlas", "ensure_gpu",
-            "Uploading atlas {}x{} with {} mip levels to GPU",
+            "Uploading albedo+normal atlas {}x{} with {} mip levels to GPU",
             ATLAS_WIDTH, ATLAS_HEIGHT, MIP_LEVELS
         );
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        // ---- Albedo atlas ----
+        let albedo_texture = device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("TextureAtlas"),
             size:            wgpu::Extent3d {
                 width: ATLAS_WIDTH,
@@ -112,16 +123,16 @@ impl TextureAtlas {
             dimension:       wgpu::TextureDimension::D2,
             format:          wgpu::TextureFormat::Rgba8Unorm,
             usage:           wgpu::TextureUsages::TEXTURE_BINDING
-                           | wgpu::TextureUsages::COPY_DST,
+                | wgpu::TextureUsages::COPY_DST,
             view_formats:    &[],
         });
 
-        // Upload mip level 0 (base)
+        // Upload albedo mip level 0
         let w0 = ATLAS_WIDTH;
         let h0 = ATLAS_HEIGHT;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture:   &texture,
+                texture:   &albedo_texture,
                 mip_level: 0,
                 origin:    wgpu::Origin3d::ZERO,
                 aspect:    wgpu::TextureAspect::All,
@@ -135,15 +146,14 @@ impl TextureAtlas {
             wgpu::Extent3d { width: w0, height: h0, depth_or_array_layers: 1 },
         );
 
-        // Upload mip levels 1..N
+        // Upload albedo mip levels 1..N
         for (i, mip) in self.mip_images.iter().enumerate() {
             let level = (i + 1) as u32;
             let w = ATLAS_WIDTH >> level;
             let h = ATLAS_HEIGHT >> level;
-
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture:   &texture,
+                    texture:   &albedo_texture,
                     mip_level: level,
                     origin:    wgpu::Origin3d::ZERO,
                     aspect:    wgpu::TextureAspect::All,
@@ -156,28 +166,93 @@ impl TextureAtlas {
                 },
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
-
             debug_log!(
                 "TextureAtlas", "ensure_gpu",
-                "Uploaded mip level {} ({}x{})", level, w, h
+                "Albedo mip level {} ({}x{})", level, w, h
             );
         }
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.gpu_texture = Some(texture);
-        self.gpu_view    = Some(view);
+        let albedo_view = albedo_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.gpu_texture = Some(albedo_texture);
+        self.gpu_view    = Some(albedo_view);
 
-        debug_log!("TextureAtlas", "ensure_gpu", "Atlas uploaded with mip chain");
+        // ---- Normal map atlas ----
+        let normal_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label:           Some("NormalAtlas"),
+            size:            wgpu::Extent3d {
+                width: ATLAS_WIDTH,
+                height: ATLAS_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: MIP_LEVELS,
+            sample_count:    1,
+            dimension:       wgpu::TextureDimension::D2,
+            format:          wgpu::TextureFormat::Rgba8Unorm,
+            usage:           wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats:    &[],
+        });
+
+        // Upload normal mip level 0
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture:   &normal_texture,
+                mip_level: 0,
+                origin:    wgpu::Origin3d::ZERO,
+                aspect:    wgpu::TextureAspect::All,
+            },
+            &self.normal_image,
+            wgpu::TexelCopyBufferLayout {
+                offset:         0,
+                bytes_per_row:  Some(ATLAS_WIDTH * 4),
+                rows_per_image: Some(ATLAS_HEIGHT),
+            },
+            wgpu::Extent3d { width: ATLAS_WIDTH, height: ATLAS_HEIGHT, depth_or_array_layers: 1 },
+        );
+
+        // Upload normal mip levels 1..N
+        for (i, mip) in self.normal_mip_images.iter().enumerate() {
+            let level = (i + 1) as u32;
+            let w = ATLAS_WIDTH >> level;
+            let h = ATLAS_HEIGHT >> level;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture:   &normal_texture,
+                    mip_level: level,
+                    origin:    wgpu::Origin3d::ZERO,
+                    aspect:    wgpu::TextureAspect::All,
+                },
+                mip,
+                wgpu::TexelCopyBufferLayout {
+                    offset:         0,
+                    bytes_per_row:  Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            debug_log!(
+                "TextureAtlas", "ensure_gpu",
+                "Normal mip level {} ({}x{})", level, w, h
+            );
+        }
+
+        let normal_view = normal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.normal_gpu_texture = Some(normal_texture);
+        self.normal_gpu_view    = Some(normal_view);
+
+        debug_log!("TextureAtlas", "ensure_gpu", "Albedo + normal atlas uploaded with mip chains");
     }
 
     pub fn texture_view(&self) -> Option<&wgpu::TextureView> { self.gpu_view.as_ref() }
+
+    /// Normal map atlas view (same slot layout as albedo atlas).
+    pub fn normal_texture_view(&self) -> Option<&wgpu::TextureView> { self.normal_gpu_view.as_ref() }
 
     // -----------------------------------------------------------------------
     // Mip generation — per-tile box filter (prevents atlas tile bleeding)
     // -----------------------------------------------------------------------
 
     /// Generate MIP_LEVELS−1 mip images from the base atlas.
-    /// Each tile is downsampled independently using a 2×2 box filter.
     fn generate_mip_chain(base: &RgbaImage) -> Vec<RgbaImage> {
         let mut mips = Vec::with_capacity((MIP_LEVELS - 1) as usize);
         let mut prev = base.clone();
@@ -193,13 +268,11 @@ impl TextureAtlas {
 
             for row in 0..ATLAS_ROWS {
                 for col in 0..ATLAS_COLS {
-                    // Box-filter downsample this tile independently
                     for ty in 0..new_tile {
                         for tx in 0..new_tile {
                             let sx = col * prev_tile_size + tx * 2;
                             let sy = row * prev_tile_size + ty * 2;
 
-                            // Average 2×2 block
                             let mut r = 0u32;
                             let mut g = 0u32;
                             let mut b = 0u32;
@@ -250,14 +323,21 @@ impl TextureAtlas {
 
     fn build_from_dir(dir: &std::path::Path) -> Result<Self, String> {
         let mut atlas_img = RgbaImage::new(ATLAS_WIDTH, ATLAS_HEIGHT);
+        let mut normal_img = RgbaImage::new(ATLAS_WIDTH, ATLAS_HEIGHT);
         let mut uv_map    = HashMap::new();
 
         fill_tile_solid(&mut atlas_img, 0, 0, 255, 255, 255);
+        fill_tile_flat_normal(&mut normal_img, 0, 0);
 
         let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
             .map_err(|e| format!("Cannot read dir: {}", e))?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "png"))
+            .filter(|e| {
+                e.path().extension().map_or(false, |ext| ext == "png")
+                    && !e.path().file_stem()
+                    .and_then(|s| s.to_str())
+                    .map_or(false, |s| s.ends_with("_n"))
+            })
             .collect();
 
         entries.sort_by_key(|e| e.file_name());
@@ -286,6 +366,33 @@ impl TextureAtlas {
 
             imageops::overlay(&mut atlas_img, &tile, (col * TILE_SIZE) as i64, (row * TILE_SIZE) as i64);
 
+            // --- Normal map: try to load <stem>_n.png ---
+            let normal_path = dir.join(format!("{}_n.png", stem));
+            if normal_path.exists() {
+                match image::open(&normal_path) {
+                    Ok(normal_dyn_img) => {
+                        let normal_rgba = normal_dyn_img.to_rgba8();
+                        let normal_tile = if normal_rgba.width() != TILE_SIZE || normal_rgba.height() != TILE_SIZE {
+                            imageops::resize(&normal_rgba, TILE_SIZE, TILE_SIZE, imageops::FilterType::Nearest)
+                        } else { normal_rgba };
+                        imageops::overlay(&mut normal_img, &normal_tile, (col * TILE_SIZE) as i64, (row * TILE_SIZE) as i64);
+                        debug_log!(
+                            "TextureAtlas", "build_from_dir",
+                            "Loaded normal map '{}_n' => slot ({},{})", stem, col, row
+                        );
+                    }
+                    Err(e) => {
+                        debug_log!(
+                            "TextureAtlas", "build_from_dir",
+                            "Failed to load normal map '{:?}': {}, using flat", normal_path, e
+                        );
+                        fill_tile_flat_normal_at(&mut normal_img, col, row);
+                    }
+                }
+            } else {
+                fill_tile_flat_normal_at(&mut normal_img, col, row);
+            }
+
             let u0 = col as f32 / ATLAS_COLS as f32;
             let v0 = row as f32 / ATLAS_ROWS as f32;
             let u1 = (col + 1) as f32 / ATLAS_COLS as f32;
@@ -304,12 +411,17 @@ impl TextureAtlas {
         );
 
         let mip_images = Self::generate_mip_chain(&atlas_img);
+        let normal_mip_images = Self::generate_mip_chain(&normal_img);
         Ok(Self {
             image: atlas_img,
             mip_images,
+            normal_image: normal_img,
+            normal_mip_images,
             layout: TextureAtlasLayout { uv_map },
             gpu_texture: None,
             gpu_view: None,
+            normal_gpu_texture: None,
+            normal_gpu_view: None,
         })
     }
 
@@ -318,12 +430,14 @@ impl TextureAtlas {
     // -----------------------------------------------------------------------
 
     fn build_embedded() -> Self {
-        debug_log!("TextureAtlas", "build_embedded", "Generating procedural embedded textures");
+        debug_log!("TextureAtlas", "build_embedded", "Generating procedural embedded textures (albedo + normal)");
 
         let mut atlas_img = RgbaImage::new(ATLAS_WIDTH, ATLAS_HEIGHT);
+        let mut normal_img = RgbaImage::new(ATLAS_WIDTH, ATLAS_HEIGHT);
         let mut uv_map    = HashMap::new();
 
         fill_tile_solid(&mut atlas_img, 0, 0, 255, 255, 255);
+        fill_tile_flat_normal(&mut normal_img, 0, 0);
 
         let textures: [(&str, u8, u8, u8); 7] = [
             ("grass_top",    56, 133,  36),
@@ -341,6 +455,7 @@ impl TextureAtlas {
             let row  = slot / ATLAS_COLS;
 
             fill_tile_noisy(&mut atlas_img, col, row, r, g, b, 20);
+            fill_tile_flat_normal_at(&mut normal_img, col, row);
 
             let u0 = col as f32 / ATLAS_COLS as f32;
             let v0 = row as f32 / ATLAS_ROWS as f32;
@@ -357,12 +472,17 @@ impl TextureAtlas {
         debug_log!("TextureAtlas", "build_embedded", "Total procedural textures: {}", uv_map.len());
 
         let mip_images = Self::generate_mip_chain(&atlas_img);
+        let normal_mip_images = Self::generate_mip_chain(&normal_img);
         Self {
             image: atlas_img,
             mip_images,
+            normal_image: normal_img,
+            normal_mip_images,
             layout: TextureAtlasLayout { uv_map },
             gpu_texture: None,
             gpu_view: None,
+            normal_gpu_texture: None,
+            normal_gpu_view: None,
         }
     }
 }
@@ -390,6 +510,21 @@ fn fill_tile_noisy(atlas: &mut RgbaImage, col: u32, row: u32, r: u8, g: u8, b: u
         let nb = (b as i16 + variation).clamp(0, 255) as u8;
         atlas.put_pixel(x, y, Rgba([nr, ng, nb, 255]));
     }}
+}
+
+/// Fill a tile with a flat normal map (pointing straight up in tangent space).
+/// RGB = (128, 128, 255) encodes N = (0, 0, 1) in tangent space.
+fn fill_tile_flat_normal(atlas: &mut RgbaImage, col: u32, row: u32) {
+    let x0 = col * TILE_SIZE;
+    let y0 = row * TILE_SIZE;
+    for y in y0..y0+TILE_SIZE { for x in x0..x0+TILE_SIZE {
+        atlas.put_pixel(x, y, Rgba([128, 128, 255, 255]));
+    }}
+}
+
+/// Same as `fill_tile_flat_normal` but takes already-computed x0/y0.
+fn fill_tile_flat_normal_at(atlas: &mut RgbaImage, col: u32, row: u32) {
+    fill_tile_flat_normal(atlas, col, row);
 }
 
 fn simple_hash(x: u32, y: u32) -> u8 {

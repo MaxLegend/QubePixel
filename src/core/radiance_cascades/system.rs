@@ -18,7 +18,7 @@ use glam::Vec3;
 
 use wgpu::util::DeviceExt;
 
-use crate::debug_log;
+use crate::{debug_log, flow_debug_log};
 
 use super::types::*;
 use super::sampling::*;
@@ -30,7 +30,8 @@ use super::voxel_tex::*;
 
 const _: () = assert!(std::mem::size_of::<CascadeDispatchParams>() == 64);
 const _: () = assert!(std::mem::size_of::<MergeParams>() == 96);
-const _: () = assert!(std::mem::size_of::<GiSampleParams>() == 32);
+const _: () = assert!(std::mem::size_of::<GiCascadeEntry>() == 32);
+const _: () = assert!(std::mem::size_of::<GiSampleParams>() == 176);
 const _: () = assert!(std::mem::size_of::<RadianceInterval>() == 48);
 
 // ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ pub struct CascadeDispatchParams {
     pub grid_origin_z:     f32,   // [ 48]
     pub opaque_threshold:  f32,   // [ 52]
     pub sky_brightness:    f32,   // [ 56]
-    pub _pad:              f32,   // [ 60]
+    pub cascade_level:     u32,   // [ 60]  0=C0 finest, 4=C4 coarsest
 }
 // ---------------------------------------------------------------------------
 // MergeParams — 96 bytes
@@ -145,21 +146,37 @@ pub struct MergeParams {
     pub opaque_threshold:        f32,   // [ 92]
 }
 // ---------------------------------------------------------------------------
-// GiSampleParams — 32 bytes (fragment shader uniform)
+// GiCascadeEntry — 32 bytes (one entry per cascade level in GiSampleParams)
 // ---------------------------------------------------------------------------
-// Matches GiSampleParams in gi_sample.wgsl.
+// Matches GiCascadeEntry in pbr_lighting.wgsl.
+// Uses vec4 layout so AlignOf = 16, which satisfies WGSL uniform array rules
+// (array element must have AlignOf >= 16 in uniform address space).
+
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct GiCascadeEntry {
+    /// [0..16] .xyz = grid world origin, .w = probe grid spacing
+    pub origin_and_spacing: [f32; 4],
+    /// [16..24] [0] = ray_count per probe, [1] = grid_size per axis
+    pub counts: [u32; 2],
+    pub _pad: [u32; 2],        // [24..32] padding
+}
+
+// ---------------------------------------------------------------------------
+// GiSampleParams — 176 bytes (fragment shader uniform)
+// ---------------------------------------------------------------------------
+// Matches GiSampleParams in pbr_lighting.wgsl.
+// Contains one GiCascadeEntry per cascade level so the fragment shader can
+// select the finest cascade that spatially covers each fragment.
 
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct GiSampleParams {
-    pub grid_origin_x: f32,    // [  0] C0 grid world origin
-    pub grid_origin_y: f32,    // [  4]
-    pub grid_origin_z: f32,    // [  8]
-    pub grid_spacing: f32,     // [ 12] C0 probe spacing
-    pub ray_count: f32,        // [ 16] C0 rays per probe
-    pub grid_size: f32,        // [ 20] C0 grid resolution
-    pub gi_intensity: f32,     // [ 24] overall GI strength multiplier
-    pub bounce_intensity: f32, // [ 28] indirect bounce multiplier
+    pub cascades: [GiCascadeEntry; NUM_CASCADES], // [0..160]  5 × 32B
+    pub gi_intensity: f32,                        // [160]
+    pub bounce_intensity: f32,                    // [164]
+    pub _pad0: f32,                               // [168]
+    pub _pad1: f32,                               // [172]
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +218,7 @@ pub struct RadianceCascadeSystemGpu {
     rm_uniform_buffers: Vec<wgpu::Buffer>,
 
     // ---- Shared merge uniform buffer (96B, rewritten per merge step) ----
-    merge_uniform_buffer: wgpu::Buffer,
+    merge_uniform_buffers: Vec<wgpu::Buffer>,
 
     // ---- Ray March pipeline ----
     ray_march_pipeline: wgpu::ComputePipeline,
@@ -228,6 +245,22 @@ pub struct RadianceCascadeSystemGpu {
     // ---- CPU-side builders ----
     voxel_builder: VoxelTextureBuilder,
     lut_builder: BlockLUTBuilder,
+
+    // ---- Staggered dispatch ----
+    /// Counts how many times dispatch() has been called.
+    /// Used to stagger coarse cascade updates: C2-C4 only every 4th dispatch.
+    dispatch_counter: u32,
+}
+
+/// Key RC parameters exposed to the debug overlay (CPU-side snapshot).
+#[derive(Debug, Clone, Copy)]
+pub struct RcDebugInfo {
+    pub c0_grid_origin: Vec3,
+    pub voxel_origin:   Vec3,
+    pub c0_grid_size:   u32,
+    pub c0_spacing:     f32,
+    pub c0_rays:        u32,
+    pub c0_ray_length:  f32,
 }
 
 impl RadianceCascadeSystemGpu {
@@ -359,8 +392,11 @@ impl RadianceCascadeSystemGpu {
                 mapped_at_creation: false,
             }));
 
-            // Ray direction buffer (immutable, uploaded once)
-            let directions = fibonacci_sphere_directions(cfg.ray_count);
+            // Ray direction buffer (immutable, uploaded once).
+            // derive_subdiv maps ray_count → subdiv so cube_face_directions
+            // returns exactly cfg.ray_count uniformly-spaced directions.
+            let subdiv = derive_subdiv(cfg.ray_count);
+            let directions = cube_face_directions(subdiv);
             let dir_data: Vec<f32> = directions
                 .iter()
                 .flat_map(|d| [d.x, d.y, d.z, 0.0f32])
@@ -391,12 +427,16 @@ impl RadianceCascadeSystemGpu {
         // ----------------------------------------------------------------
         // 4. Merge uniform buffer (96B, reused for each merge step)
         // ----------------------------------------------------------------
-        let merge_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rc_merge_uniform"),
-            size: 96,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let merge_uniform_buffers: Vec<wgpu::Buffer> = (0..NUM_CASCADES - 1)
+            .map(|k| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("rc_merge_uniform_{}", k)),
+                    size: std::mem::size_of::<MergeParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .collect();
 
         // ----------------------------------------------------------------
         // 5. Ray March compute pipeline + bind groups
@@ -583,17 +623,22 @@ impl RadianceCascadeSystemGpu {
         // Create merge bind groups: merge_bind_groups[k] for step
         //   child = configs[k+1], parent = configs[k],   k = 0..NUM_CASCADES-1
         //   k=0: C3<-C4,  k=1: C2<-C3,  k=2: C1<-C2,  k=3: C0<-C1
+        // Merge chain (coarse→fine):
+        //   k=0: parent=C4 (idx=4), child=C3 (idx=3)
+        //   k=1: parent=C3 (idx=3), child=C2 (idx=2)
+        //   k=2: parent=C2 (idx=2), child=C1 (idx=1)
+        //   k=3: parent=C1 (idx=1), child=C0 (idx=0)
         let merge_bind_groups: Vec<wgpu::BindGroup> = (0..NUM_CASCADES - 1)
             .map(|k| {
-                let parent_idx = k;
-                let child_idx = k + 1;
+                let parent_idx = NUM_CASCADES - 1 - k; // 4, 3, 2, 1
+                let child_idx  = parent_idx - 1;        // 3, 2, 1, 0
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("rc_merge_bg_{}to{}", child_idx, parent_idx)),
+                    label: Some(&format!("rc_merge_bg_c{}fromc{}", child_idx, parent_idx)),
                     layout: &merge_bgl,
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: merge_uniform_buffer.as_entire_binding(),
+                            resource: merge_uniform_buffers[k].as_entire_binding(),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
@@ -611,38 +656,46 @@ impl RadianceCascadeSystemGpu {
         // ----------------------------------------------------------------
         // 7. GI sampling resources (for fragment shader)
         // ----------------------------------------------------------------
-        // Bind group layout: @0 = uniform GiSampleParams, @1 = storage C0 output
+        // Bind group layout:
+        //   @binding(0) uniform GiSampleParams (176B) — params for all 5 cascades
+        //   @binding(1..5) storage<read> C0..C4 output interval buffers
+        // Fragment shader picks the finest cascade whose grid covers the fragment.
+        let gi_storage_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
         let gi_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rc_gi_sample_bgl"),
             entries: &[
-                // @binding(0) uniform GiSampleParams (32B)
+                // @binding(0) uniform GiSampleParams (176B)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: Some(std::num::NonZeroU64::new(32).unwrap()),
+                        min_binding_size: Some(std::num::NonZeroU64::new(176).unwrap()),
                     },
                     count: None,
                 },
-                // @binding(1) storage<read> c0_intervals
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                gi_storage_entry(1), // C0 intervals
+                gi_storage_entry(2), // C1 intervals
+                gi_storage_entry(3), // C2 intervals
+                gi_storage_entry(4), // C3 intervals
+                gi_storage_entry(5), // C4 intervals
             ],
         });
 
         let gi_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rc_gi_params"),
-            size: 32,
+            size: 176,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -655,10 +708,11 @@ impl RadianceCascadeSystemGpu {
                     binding: 0,
                     resource: gi_params_buffer.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffers[0].as_entire_binding(), // C0 output
-                },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buffers[0].as_entire_binding() }, // C0
+                wgpu::BindGroupEntry { binding: 2, resource: output_buffers[1].as_entire_binding() }, // C1
+                wgpu::BindGroupEntry { binding: 3, resource: output_buffers[2].as_entire_binding() }, // C2
+                wgpu::BindGroupEntry { binding: 4, resource: output_buffers[3].as_entire_binding() }, // C3
+                wgpu::BindGroupEntry { binding: 5, resource: output_buffers[4].as_entire_binding() }, // C4
             ],
         });
 
@@ -679,7 +733,7 @@ impl RadianceCascadeSystemGpu {
             output_buffers,
             ray_dir_buffers,
             rm_uniform_buffers,
-            merge_uniform_buffer,
+            merge_uniform_buffers,
             ray_march_pipeline,
             rm_bind_groups,
             merge_pipeline,
@@ -689,6 +743,7 @@ impl RadianceCascadeSystemGpu {
             gi_bg,
             voxel_builder: VoxelTextureBuilder::new(),
             lut_builder,
+            dispatch_counter: 0,
         }
     }
 
@@ -702,15 +757,22 @@ impl RadianceCascadeSystemGpu {
     /// Call this BEFORE filling voxel/block data, so world_to_texel
     /// mappings are correct.
     pub fn recenter(&mut self, camera_pos: Vec3) {
-        self.voxel_builder.recenter(camera_pos);
+        // NOTE: Do NOT call voxel_builder.recenter() here — it would clear the
+        // voxel data every frame. The voxel texture is updated only when the
+        // world worker sends a fresh snapshot (via set_data_raw in game_screen).
 
         for i in 0..NUM_CASCADES {
             let cfg = &self.configs[i];
-            let extent = cfg.grid_spacing * cfg.grid_half_extent as f32;
-            self.grid_origins[i] = camera_pos - Vec3::new(extent, extent, extent);
+            let spacing = cfg.grid_spacing;
+            // Snap the grid origin to the nearest integer multiple of grid_spacing.
+            // This keeps probe world-space positions fixed until the camera crosses
+            // a full cell boundary, preventing light from drifting/shifting with camera movement.
+            let snapped = (camera_pos / spacing).floor() * spacing;
+            let extent = spacing * cfg.grid_half_extent as f32;
+            self.grid_origins[i] = snapped - Vec3::new(extent, extent, extent) + Vec3::splat(spacing * 0.5);
         }
 
-        debug_log!(
+        flow_debug_log!(
             "RCSystemGpu", "recenter",
             "Recentered to ({:.1}, {:.1}, {:.1})",
             camera_pos.x, camera_pos.y, camera_pos.z
@@ -744,6 +806,37 @@ impl RadianceCascadeSystemGpu {
                 width: VOXEL_TEX_SIZE,
                 height: VOXEL_TEX_SIZE,
                 depth_or_array_layers: VOXEL_TEX_SIZE,
+            },
+        );
+    }
+
+    /// Upload a single 16³ voxel-texture sub-region (Partial update path).
+    ///
+    /// `region.data` must be exactly 16³ = 4096 u16 elements.
+    /// Layout: `data[dx + dy*16 + dz*16*16]` — matches write_texture row layout.
+    pub fn upload_voxel_region(
+        &self,
+        queue: &wgpu::Queue,
+        region: &crate::core::gameobjects::world::VoxelChunkRegion,
+    ) {
+        let cs = 16u32;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture:   &self.voxel_texture,
+                mip_level: 0,
+                origin:    wgpu::Origin3d { x: region.tx, y: region.ty, z: region.tz },
+                aspect:    wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&region.data),
+            wgpu::TexelCopyBufferLayout {
+                offset:         0,
+                bytes_per_row:  Some(cs * 2),   // 16 * 2 = 32 bytes per x-row
+                rows_per_image: Some(cs),        // 16 y-rows per z-slice
+            },
+            wgpu::Extent3d {
+                width:                 cs,
+                height:                cs,
+                depth_or_array_layers: cs,
             },
         );
     }
@@ -794,19 +887,26 @@ impl RadianceCascadeSystemGpu {
         queue: &wgpu::Queue,
         sky_brightness: f32,
     ) {
-        debug_log!(
+        self.dispatch_counter = self.dispatch_counter.wrapping_add(1);
+
+        // Staggered dispatch: coarse cascades (C2-C4) are only re-marched
+        // every 4th dispatch because they change slowly (large spacing, far
+        // from camera). C0-C1 are always marched for responsive near-field GI.
+        // The output buffers persist in VRAM, so stale coarse data is reused.
+        let full_dispatch = self.dispatch_counter % 4 == 0;
+
+        flow_debug_log!(
             "RCSystemGpu", "dispatch",
-            "Dispatching RC pipeline (sky_brightness={:.2})", sky_brightness
+            "Dispatching RC pipeline (sky_brightness={:.2}, full={})",
+            sky_brightness, full_dispatch
         );
 
         // ----------------------------------------------------------------
-        // Pass 1: Ray march for each cascade (C4 first, C0 last)
+        // Pass 1: Ray march — C0-C1 always, C2-C4 only on full dispatch
         // ----------------------------------------------------------------
-        // We go coarse-to-fine so that finer cascades can potentially
-        // reference coarser results (though in current impl each cascade
-        // is independent — the merge step handles inter-cascade flow).
 
-        for i in 0..NUM_CASCADES {
+        let march_upper = if full_dispatch { NUM_CASCADES } else { 2 };
+        for i in 0..march_upper {
             let cfg = &self.configs[i];
             let origin = &self.grid_origins[i];
 
@@ -848,7 +948,7 @@ impl RadianceCascadeSystemGpu {
                 grid_origin_z:     origin.z,
                 opaque_threshold:  OPAQUE_THRESHOLD,
                 sky_brightness,
-                _pad:              0.0,
+                cascade_level:     i as u32,
             };
             queue.write_buffer(&self.rm_uniform_buffers[i], 0, bytemuck::cast_slice(&[params]));
 
@@ -868,7 +968,7 @@ impl RadianceCascadeSystemGpu {
                 pass.dispatch_workgroups(dispatch_x as u32, 1, 1);
             }
 
-            debug_log!(
+            flow_debug_log!(
                 "RCSystemGpu", "dispatch",
                 "  C{}: {} probes x {} rays = {} invocations ({} wg)",
                 i, total_probes, cfg.ray_count, invocations, dispatch_x
@@ -883,17 +983,23 @@ impl RadianceCascadeSystemGpu {
         //   k=1: parent=C3 (idx=3), child=C2 (idx=2)
         //   k=2: parent=C2 (idx=2), child=C1 (idx=1)
         //   k=3: parent=C1 (idx=1), child=C0 (idx=0)
+        //
+        // On non-full dispatch, skip coarse merges (C3←C4, C2←C3) since
+        // neither parent nor child was re-marched — results would be identical.
+        // Only merge C1←C2 and C0←C1 (k=2,3) to propagate stale coarse data
+        // into the freshly marched C0-C1.
+        let merge_start = if full_dispatch { 0 } else { NUM_CASCADES - 3 }; // skip first 2 steps
 
-        for k in 0..NUM_CASCADES - 1 {
-            let parent_idx = k;     // coarser
-            let child_idx = k + 1;  // finer
+        for k in merge_start..NUM_CASCADES - 1 {
+            // Coarse → fine: k=0 → parent=C4,child=C3 … k=3 → parent=C1,child=C0
+            let parent_idx = NUM_CASCADES - 1 - k; // 4, 3, 2, 1
+            let child_idx  = parent_idx - 1;        // 3, 2, 1, 0
 
             let parent_cfg = &self.configs[parent_idx];
-            let child_cfg = &self.configs[child_idx];
-            let parent_origin = &self.grid_origins[parent_idx];
-            let child_origin = &self.grid_origins[child_idx];
+            let child_cfg  = &self.configs[child_idx];
+            let parent_origin = self.grid_origins[parent_idx];
+            let child_origin  = self.grid_origins[child_idx];
 
-            // Update merge uniform
             let mp = MergeParams {
                 // -- Child cascade --
                 child_grid_spacing:      child_cfg.grid_spacing,
@@ -923,7 +1029,8 @@ impl RadianceCascadeSystemGpu {
                 parent_origin_z:         parent_origin.z,
                 opaque_threshold:        OPAQUE_THRESHOLD,
             };
-            queue.write_buffer(&self.merge_uniform_buffer, 0, bytemuck::cast_slice(&[mp]));
+            // Write to per-pass buffer (no aliasing between passes)
+            queue.write_buffer(&self.merge_uniform_buffers[k], 0, bytemuck::cast_slice(&[mp]));
 
             // Dispatch: 1 invocation = 1 (child_probe, child_ray)
             let child_probes = child_cfg.total_probes();
@@ -941,7 +1048,7 @@ impl RadianceCascadeSystemGpu {
                 pass.dispatch_workgroups(dispatch_x as u32, 1, 1);
             }
 
-            debug_log!(
+            flow_debug_log!(
                 "RCSystemGpu", "dispatch",
                 "  Merge C{}<-C{}: {} child probes x {} rays = {} invocations",
                 child_idx, parent_idx, child_probes, child_rays, invocations
@@ -949,27 +1056,39 @@ impl RadianceCascadeSystemGpu {
         }
 
         // ----------------------------------------------------------------
-        // Pass 3: Update GI params for fragment shader
+        // Pass 3: Update GI params for fragment shader (all 5 cascades)
         // ----------------------------------------------------------------
-        let c0_cfg = &self.configs[0];
-        let c0_origin = &self.grid_origins[0];
+        // Each GiCascadeEntry carries origin+spacing+ray_count+grid_size for
+        // one cascade level. The fragment shader picks the finest cascade whose
+        // probe grid spatially covers the fragment, giving full-scene GI coverage.
+        let mut cascade_entries = [GiCascadeEntry {
+            origin_and_spacing: [0.0; 4],
+            counts: [0; 2],
+            _pad: [0; 2],
+        }; NUM_CASCADES];
+        for i in 0..NUM_CASCADES {
+            let cfg    = &self.configs[i];
+            let origin = self.grid_origins[i];
+            cascade_entries[i] = GiCascadeEntry {
+                origin_and_spacing: [origin.x, origin.y, origin.z, cfg.grid_spacing],
+                counts: [cfg.ray_count, cfg.grid_size()],
+                _pad: [0; 2],
+            };
+        }
         let gi_params = GiSampleParams {
-            grid_origin_x: c0_origin.x,
-            grid_origin_y: c0_origin.y,
-            grid_origin_z: c0_origin.z,
-            grid_spacing: c0_cfg.grid_spacing,
-            ray_count: c0_cfg.ray_count as f32,
-            grid_size: c0_cfg.grid_size() as f32,
-            gi_intensity: 1.0,      // Can be exposed as a gameplay setting
-            bounce_intensity: 0.5,  // Indirect bounces are dimmer
+            cascades: cascade_entries,
+            gi_intensity: 1.0,      // Overall GI contribution
+            bounce_intensity: 1.4,  // Block emission bounce multiplier (glowstone etc.)
+            _pad0: 0.0,
+            _pad1: 0.0,
         };
         queue.write_buffer(&self.gi_params_buffer, 0, bytemuck::cast_slice(&[gi_params]));
 
-        debug_log!(
+        flow_debug_log!(
             "RCSystemGpu", "dispatch",
-            "GI params updated: grid_origin=({:.1},{:.1},{:.1}), spacing={:.1}, rays={:.0}",
-            c0_origin.x, c0_origin.y, c0_origin.z,
-            c0_cfg.grid_spacing, c0_cfg.ray_count
+            "GI params updated: C0 origin=({:.1},{:.1},{:.1}) spacing={:.1}, C4 spacing={:.1}",
+            self.grid_origins[0].x, self.grid_origins[0].y, self.grid_origins[0].z,
+            self.configs[0].grid_spacing, self.configs[NUM_CASCADES - 1].grid_spacing
         );
     }
 
@@ -997,6 +1116,19 @@ impl RadianceCascadeSystemGpu {
         self.grid_origins[cascade_idx]
     }
 
+    /// Snapshot of key RC parameters for the debug overlay.
+    pub fn debug_info(&self) -> RcDebugInfo {
+        let c0 = &self.configs[0];
+        RcDebugInfo {
+            c0_grid_origin:  self.grid_origins[0],
+            voxel_origin:    self.voxel_builder.world_origin().as_vec3(),
+            c0_grid_size:    c0.grid_size(),
+            c0_spacing:      c0.grid_spacing,
+            c0_rays:         c0.ray_count,
+            c0_ray_length:   c0.ray_length,
+        }
+    }
+
     /// Estimated total GPU memory usage in bytes.
     pub fn estimated_gpu_memory(&self) -> u64 {
         let mut total = 0u64;
@@ -1020,7 +1152,7 @@ impl RadianceCascadeSystemGpu {
         total += 96;
 
         // GI params
-        total += 32;
+        total += 176;
 
         total
     }

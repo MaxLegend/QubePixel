@@ -52,22 +52,19 @@ impl UploadWorker {
         let handle = thread::Builder::new()
             .name("gpu-staging".into())
             .spawn(move || {
-                let vert_stride = std::mem::size_of::<Vertex3D>();
-                let idx_stride  = std::mem::size_of::<u32>();
-
-                // Reusable staging buffer — avoids per-batch allocation
-                let mut staging: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024);
+                // No staging buffer needed: bytemuck::cast_slice is a zero-cost
+                // reinterpret of the existing Vec<Vertex3D> / Vec<u32> memory.
+                // One allocation per job (the to_vec() copy) is unavoidable because
+                // data must cross the channel boundary, but the old 4–36 MB staging
+                // buffer that doubled peak RAM usage is eliminated.
                 let mut total_packed = 0usize;
 
                 loop {
-                    // Block until at least one job arrives.
-                    // When job_tx is dropped, recv() returns Err → clean exit.
                     let first = match job_rx.recv() {
                         Ok(job) => job,
                         Err(_)  => break,
                     };
 
-                    // Drain every additional pending job into a single batch
                     let mut batch = Vec::with_capacity(64);
                     batch.push(first);
                     while let Ok(job) = job_rx.try_recv() {
@@ -76,23 +73,6 @@ impl UploadWorker {
 
                     let t0        = Instant::now();
                     let batch_len = batch.len();
-
-                    // Calculate total staging size
-                    let mut needed: usize = 0;
-                    for job in &batch {
-                        needed += job.vertices.len() * vert_stride;
-                        needed += job.indices.len()  * idx_stride;
-                    }
-
-                    // Grow staging buffer only if necessary (amortised)
-                    if staging.capacity() < needed {
-                        let grow = (needed * 2).max(4 * 1024 * 1024);
-                        staging.reserve(grow - staging.len());
-                    }
-                    staging.clear();
-                    staging.resize(needed, 0);
-
-                    let mut offset = 0usize;
                     let mut packed = 0usize;
 
                     for job in batch {
@@ -100,33 +80,11 @@ impl UploadWorker {
                             continue;
                         }
 
-                        let vert_bytes = job.vertices.len() * vert_stride;
-                        let idx_bytes  = job.indices.len()  * idx_stride;
-
-                        let vert_off = offset;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                job.vertices.as_ptr() as *const u8,
-                                staging[vert_off..].as_mut_ptr(),
-                                vert_bytes,
-                            );
-                        }
-                        offset += vert_bytes;
-
-                        let idx_off = offset;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                job.indices.as_ptr() as *const u8,
-                                staging[idx_off..].as_mut_ptr(),
-                                idx_bytes,
-                            );
-                        }
-                        offset += idx_bytes;
-
+                        // Zero-copy reinterpret + one owned copy for the channel.
                         let vertex_data: Vec<u8> =
-                            staging[vert_off..vert_off + vert_bytes].to_vec();
+                            bytemuck::cast_slice::<Vertex3D, u8>(&job.vertices).to_vec();
                         let index_data: Vec<u8> =
-                            staging[idx_off..idx_off + idx_bytes].to_vec();
+                            bytemuck::cast_slice::<u32, u8>(&job.indices).to_vec();
 
                         packed += 1;
                         total_packed += 1;
@@ -144,10 +102,9 @@ impl UploadWorker {
                     let us = t0.elapsed().as_micros();
                     flow_debug_log!(
                         "UploadWorker", "thread",
-                        "[PERF] batch={} packed={} total={} time={:.2}ms staging={:.1}KB",
+                        "[PERF] batch={} packed={} total={} time={:.2}ms",
                         batch_len, packed, total_packed,
                         us as f64 / 1000.0,
-                        needed as f64 / 1024.0
                     );
                 }
 

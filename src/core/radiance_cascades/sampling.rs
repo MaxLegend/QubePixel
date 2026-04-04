@@ -28,6 +28,144 @@ pub const GOLDEN_ANGLE: f32 = 2.399_963_23; // PI * (1 + sqrt(5))
 pub const GOLDEN_RATIO: f32 = 1.618_033_99;
 
 // ---------------------------------------------------------------------------
+// Cube-Face Subdivision
+// ---------------------------------------------------------------------------
+
+/// Total number of directions for a given subdivision level.
+/// Each of the 6 cube faces is divided into subdiv×subdiv cells.
+/// subdiv=1 → 6, subdiv=2 → 24, subdiv=3 → 54, subdiv=4 → 96, subdiv=5 → 150.
+#[inline]
+pub fn cube_face_ray_count(subdiv: u32) -> u32 {
+    6 * subdiv * subdiv
+}
+
+/// Derive the cube-face subdivision level from a desired ray count.
+///
+/// Returns the smallest `subdiv` such that `6 * subdiv² >= ray_count`.
+/// This mirrors the `derive_subdiv` WGSL function in the compute shaders.
+///
+/// Valid exact levels: ray_count=6→1, 24→2, 54→3, 96→4, 150→5.
+/// For intermediate values, rounds up to the next valid subdiv.
+#[inline]
+pub fn derive_subdiv(ray_count: u32) -> u32 {
+    for i in 1u32..=10 {
+        if 6 * i * i >= ray_count {
+            return i;
+        }
+    }
+    1
+}
+
+/// Generate directions on the unit sphere by subdividing the 6 faces of a cube.
+///
+/// Each face is divided into a `subdiv × subdiv` grid. The center of each cell
+/// is projected from the cube face onto the unit sphere and normalized.
+///
+/// **Face order:** 0=+X, 1=−X, 2=+Y, 3=−Y, 4=+Z, 5=−Z
+///
+/// For subdiv=1 the result is exactly the 6 cardinal directions:
+///   (1,0,0), (−1,0,0), (0,1,0), (0,−1,0), (0,0,1), (0,0,−1)
+///
+/// For subdiv=2, each face gets 4 directions (corners at ±0.5 offset),
+/// giving 24 total — perfect for covering face diagonals and edge midpoints.
+///
+/// This is the **primary** direction generator for Radiance Cascades in
+/// QubePixel because voxel worlds have axis-aligned reflective surfaces.
+///
+/// **Panics:** if `subdiv == 0`.
+pub fn cube_face_directions(subdiv: u32) -> Vec<Vec3> {
+    assert!(subdiv > 0, "cube_face_directions: subdiv must be > 0");
+
+    let mut dirs = Vec::with_capacity((6 * subdiv * subdiv) as usize);
+
+    for face_idx in 0u32..6 {
+        for cv in 0u32..subdiv {
+            for cu in 0u32..subdiv {
+                // Map cell (cu, cv) on this face to [-1, 1] range
+                // Use cell CENTER: (cu + 0.5) / subdiv scaled to [-1, 1]
+                let u = 2.0 * (cu as f32 + 0.5) / subdiv as f32 - 1.0;
+                let v = 2.0 * (cv as f32 + 0.5) / subdiv as f32 - 1.0;
+
+                // Construct point on cube face, then normalize to unit sphere
+                let pt = cube_face_point(face_idx, u, v);
+                let dir = pt.normalize_or_zero();
+                dirs.push(dir);
+            }
+        }
+    }
+
+    dirs
+}
+
+/// Construct a 3D point on a cube face from face index and (u,v) coordinates.
+///
+/// Face layout (u = horizontal, v = vertical on the face):
+///   0: +X  → ( +1,  u,  v )
+///   1: −X  → ( −1,  u,  v )
+///   2: +Y  → (  u, +1,  v )
+///   3: −Y  → (  u, −1,  v )
+///   4: +Z  → (  u,  v, +1 )
+///   5: −Z  → (  u,  v, −1 )
+///
+/// The caller is responsible for normalizing the result.
+#[inline]
+pub fn cube_face_point(face_idx: u32, u: f32, v: f32) -> Vec3 {
+    match face_idx {
+        0 => Vec3::new( 1.0,  u,   v  ),  // +X
+        1 => Vec3::new(-1.0,  u,   v  ),  // −X
+        2 => Vec3::new( u,   1.0, v  ),  // +Y
+        3 => Vec3::new( u,  -1.0, v  ),  // −Y
+        4 => Vec3::new( u,   v,   1.0),  // +Z
+        5 => Vec3::new( u,   v,  -1.0),  // −Z
+        _ => Vec3::ZERO,
+    }
+}
+
+/// Find the index of the nearest cube-face direction to a target direction.
+///
+/// This is the O(1) analytical inverse of `cube_face_directions`:
+///   1. Find the dominant axis of `target` (max absolute component).
+///   2. Determine face_idx (0..5) from the dominant axis.
+///   3. Project target onto that face's tangent plane → (u, v).
+///   4. Convert (u, v) to cell index (cu, cv) within the subdiv×subdiv grid.
+///   5. Return the flat index: face_idx * subdiv² + cv * subdiv + cu.
+///
+/// **Panics:** if `subdiv == 0`.
+#[inline]
+pub fn nearest_cube_face_dir_index(target: Vec3, subdiv: u32) -> u32 {
+    assert!(subdiv > 0, "nearest_cube_face_dir_index: subdiv must be > 0");
+    let t = target.normalize_or_zero();
+
+    // 1. Dominant axis → determines which cube face the direction belongs to
+    let ax = t.x.abs();
+    let ay = t.y.abs();
+    let az = t.z.abs();
+
+    let (face_idx, u, v) = if ax >= ay && ax >= az {
+        if t.x >= 0.0 { (0u32, t.y, t.z) } else { (1u32, t.y, t.z) }
+    } else if ay >= az {
+        if t.y >= 0.0 { (2u32, t.x, t.z) } else { (3u32, t.x, t.z) }
+    } else {
+        if t.z >= 0.0 { (4u32, t.x, t.y) } else { (5u32, t.x, t.y) }
+    };
+
+    // 2. Project (u, v) onto [-1, 1] face coordinates
+    //    (u, v) are components of the normalized target on the tangent plane,
+    //    already in [-1, 1] range (since target is on the unit sphere).
+
+    // 3. Map [-1, 1] → cell index [0, subdiv-1]
+    let cu = ((u + 1.0) * 0.5 * subdiv as f32) as u32;
+    let cv = ((v + 1.0) * 0.5 * subdiv as f32) as u32;
+
+    // Clamp to valid range (guard against floating point edge cases)
+    let cu = cu.min(subdiv - 1);
+    let cv = cv.min(subdiv - 1);
+
+    // 4. Flat index
+    face_idx * subdiv * subdiv + cv * subdiv + cu
+}
+
+// ---------------------------------------------------------------------------
 // Fibonacci Sphere
 // ---------------------------------------------------------------------------
 

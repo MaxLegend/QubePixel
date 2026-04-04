@@ -2,10 +2,16 @@
 // QubePixel — Game3DPipeline  (camera, depth buffer, world chunk meshes)
 // =============================================================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+
+/// VRAM budget for chunk meshes.  When exceeded, the farthest chunks are
+/// evicted from GPU and re-queued in the world worker for future re-meshing.
+/// Tune this to match available VRAM (default: 256 MB).
+const CHUNK_MESH_VRAM_BUDGET: u64 = 4096 * 1024 * 1024;
 use crate::{debug_log, ext_debug_log, flow_debug_log};
 use glam::{Mat4, Vec3};
+use crate::core::config;
 
 // ---------------------------------------------------------------------------
 // FrustumPlanes
@@ -119,32 +125,54 @@ impl Camera {
 }
 
 // ---------------------------------------------------------------------------
-// Vertex3D — position + normal + colour + texcoord + ao + material + emission (72 bytes)
+// Vertex3D encoding helpers
 // ---------------------------------------------------------------------------
+
+/// Pack f32 ∈ [−1, 1] → i8 (Snorm).  Used for normals and tangents.
+#[inline(always)]
+pub fn snorm8(v: f32) -> i8 { (v.clamp(-1.0, 1.0) * 127.0).round() as i8 }
+
+/// Pack f32 ∈ [0, 1] → u8 (Unorm).  Used for color, AO, roughness, metalness.
+#[inline(always)]
+pub fn unorm8(v: f32) -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 }
+
+// ---------------------------------------------------------------------------
+// Vertex3D — packed, 52 bytes
+// ---------------------------------------------------------------------------
+
+/// Packed vertex — 52 bytes (was 96).  All fields preserved; compressed representation.
+///
+/// Layout (offsets):
+///   [  0] position:  Float32x3 — world XYZ
+///   [ 12] normal:    Snorm8x4  — xyz = normal [-1..1],  w = unused
+///   [ 16] color_ao:  Unorm8x4  — rgb = albedo [0..1],   a = AO [0..1]
+///   [ 20] texcoord:  Float32x2 — UV coordinates
+///   [ 28] material:  Unorm8x4  — r = roughness, g = metalness, ba = unused
+///   [ 32] emission:  Float32x4 — [r, g, b, intensity]  (kept f32; can exceed 1.0)
+///   [ 48] tangent:   Snorm8x4  — xyz = tangent [-1..1], w = unused
+///   [ 52] — end
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex3D {
-    pub position: [f32; 3],   // 12 bytes | location 0
-    pub normal:   [f32; 3],   // 12 bytes | location 1
-    pub color:    [f32; 3],   // 12 bytes | location 2  (albedo tint)
-    pub texcoord: [f32; 2],   // 8  bytes | location 3
-    pub ao:       f32,        // 4  bytes | location 4  vertex AO [0..1]
-    pub material: [f32; 2],   // 8  bytes | location 5  [roughness, metalness]
-    pub emission: [f32; 4],   // 16 bytes | location 6  [r, g, b, intensity]
-    pub sky_light: f32,       // 4  bytes | location 7  sky visibility [0..1]
-}
+    pub position:  [f32; 3],  // offset  0 | 12b | Float32x3
+    pub normal:    [i8;  4],  // offset 12 |  4b | Snorm8x4
+    pub color_ao:  [u8;  4],  // offset 16 |  4b | Unorm8x4
+    pub texcoord:  [f32; 2],  // offset 20 |  8b | Float32x2
+    pub material:  [u8;  4],  // offset 28 |  4b | Unorm8x4
+    pub emission:  [f32; 4],  // offset 32 | 16b | Float32x4
+    pub tangent:   [i8;  4],  // offset 48 |  4b | Snorm8x4
+}                             // total: 52 bytes
 
 impl Default for Vertex3D {
     fn default() -> Self {
         Self {
-            position: [0.0; 3],
-            normal:   [0.0, 1.0, 0.0],
-            color:    [1.0; 3],
-            texcoord: [0.0; 2],
-            ao:       1.0,
-            material: [0.9, 0.0],
-            emission: [0.0; 4],
-            sky_light: 1.0,
+            position:  [0.0; 3],
+            normal:    [0, 127, 0, 0],           // (0, 1, 0) up
+            color_ao:  [255, 255, 255, 255],     // white, ao = 1.0
+            texcoord:  [0.0; 2],
+            material:  [unorm8(0.9), 0, 0, 0],  // roughness=0.9, metalness=0
+            emission:  [0.0; 4],
+            tangent:   [127, 0, 0, 0],           // (1, 0, 0)
         }
     }
 }
@@ -181,7 +209,14 @@ pub struct Game3DPipeline {
     depth_size:        (u32, u32),
     chunk_meshes:      HashMap<(i32, i32, i32), ChunkMesh>,
     vram_usage:        u64,
-    pub culled_last_frame: u32,
+    /// LRU order: front = oldest inserted, back = most recently inserted.
+    /// Used to evict farthest chunks when VRAM budget is exceeded.
+    lru_order:         VecDeque<(i32, i32, i32)>,
+    pub culled_last_frame:        u32,
+    pub last_draw_calls:          u32,
+    pub last_shadow_draw_calls:   u32,
+    pub last_visible_triangles:   u32,
+    pub last_visible_vram_bytes:  u64,
     atlas_sampler:     Option<wgpu::Sampler>,
     outline_pipeline:           Option<wgpu::RenderPipeline>,
     outline_bind_group_layout:  Option<wgpu::BindGroupLayout>,
@@ -261,28 +296,88 @@ impl Game3DPipeline {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
                 ],
             },
         );
 
-        let gi_bgl_layout = device.create_bind_group_layout(
+let gi_bgl_layout = device.create_bind_group_layout(
             &wgpu::BindGroupLayoutDescriptor {
-                label:   Some("GI Sample BGL"),
+                label:   Some("GI Sample BGL (Placeholder)"),
                 entries: &[
-                    // @group(1) @binding(0) uniform GiSampleParams (32B)
+                    // @group(1) @binding(0) uniform GiSampleParams (176B)
                     wgpu::BindGroupLayoutEntry {
                         binding:    0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty:                 wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size:   Some(std::num::NonZeroU64::new(32).unwrap()),
+                            min_binding_size:   Some(std::num::NonZeroU64::new(176).unwrap()),
                         },
                         count: None,
                     },
                     // @group(1) @binding(1) storage<read> C0 intervals
                     wgpu::BindGroupLayoutEntry {
                         binding:    1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   None,
+                        },
+                        count: None,
+                    },
+                    // @group(1) @binding(2) storage<read> C1 intervals
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   None,
+                        },
+                        count: None,
+                    },
+                    // @group(1) @binding(3) storage<read> C2 intervals
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   None,
+                        },
+                        count: None,
+                    },
+                    // @group(1) @binding(4) storage<read> C3 intervals
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty:                 wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   None,
+                        },
+                        count: None,
+                    },
+                    // @group(1) @binding(5) storage<read> C4 intervals
+                    wgpu::BindGroupLayoutEntry {
+                        binding:    5,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty:                 wgpu::BufferBindingType::Storage { read_only: true },
@@ -307,14 +402,13 @@ impl Game3DPipeline {
             array_stride: std::mem::size_of::<Vertex3D>() as wgpu::BufferAddress,
             step_mode:    wgpu::VertexStepMode::Vertex,
             attributes:   &wgpu::vertex_attr_array![
-                0 => Float32x3,  // position
-                1 => Float32x3,  // normal
-                2 => Float32x3,  // color
-                3 => Float32x2,  // texcoord
-                4 => Float32,    // ao
-                5 => Float32x2,  // material [roughness, metalness]
-                6 => Float32x4,  // emission [r, g, b, intensity]
-                 7 => Float32,    // sky_light [0=underground, 1=open sky]
+                0 => Float32x3,  // position  (offset  0, 12b)
+                1 => Snorm8x4,   // normal    (offset 12,  4b)
+                2 => Unorm8x4,   // color_ao  (offset 16,  4b)
+                3 => Float32x2,  // texcoord  (offset 20,  8b)
+                4 => Unorm8x4,   // material  (offset 28,  4b)
+                5 => Float32x4,  // emission  (offset 32, 16b)
+                6 => Snorm8x4,   // tangent   (offset 48,  4b)
             ],
         };
 
@@ -419,14 +513,25 @@ struct Uniforms {
                 cull_mode: Some(wgpu::Face::Front),
                 ..Default::default()
             },
+            // depth_stencil: Some(wgpu::DepthStencilState {
+            //     format: wgpu::TextureFormat::Depth32Float,
+            //     depth_write_enabled: Option::from(true),
+            //     depth_compare: Option::from(wgpu::CompareFunction::Less),
+            //     stencil: wgpu::StencilState::default(),
+            //     bias: wgpu::DepthBiasState {
+            //         constant: 2,
+            //         slope_scale: 0.5,
+            //         clamp: 0.0,
+            //     },
+            // }),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Option::from(true),
                 depth_compare: Option::from(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 0.5,
+                    constant: 0,
+                    slope_scale: 0.0,
                     clamp: 0.0,
                 },
             }),
@@ -462,7 +567,12 @@ struct Uniforms {
             depth_size:    (0, 0),
             chunk_meshes:  HashMap::new(),
             vram_usage:    UNIFORM_SIZE,
-            culled_last_frame: 0,
+            lru_order:               VecDeque::new(),
+            culled_last_frame:       0,
+            last_draw_calls:         0,
+            last_shadow_draw_calls:  0,
+            last_visible_triangles:  0,
+            last_visible_vram_bytes: 0,
             atlas_sampler: None,
             outline_pipeline:          None,
             outline_bind_group_layout: None,
@@ -563,6 +673,11 @@ struct Uniforms {
     /// Insert a pre-created chunk mesh into the render map.
     /// Used by the async upload pipeline to deliver GPU buffers
     /// that were created on the main thread from packed staging data.
+    /// Insert a pre-created chunk mesh.
+    ///
+    /// Returns keys of any chunks evicted to stay within `CHUNK_MESH_VRAM_BUDGET`.
+    /// Callers should pass these back to the world worker so it re-marks them dirty
+    /// and re-meshes them when they come back into the render radius.
     pub fn insert_chunk_mesh(
         &mut self,
         key:           (i32, i32, i32),
@@ -572,10 +687,14 @@ struct Uniforms {
         vram_bytes:    u64,
         aabb_min:      [f32; 3],
         aabb_max:      [f32; 3],
-    ) {
-        // Remove old mesh if present → track freed VRAM
+    ) -> Vec<(i32, i32, i32)> {
+        // Replace existing mesh at this key (e.g. re-mesh after block edit)
         if let Some(old) = self.chunk_meshes.remove(&key) {
             self.vram_usage = self.vram_usage.saturating_sub(old.vram_bytes);
+            // Remove from LRU order (rare; linear scan acceptable here)
+            if let Some(pos) = self.lru_order.iter().position(|k| k == &key) {
+                self.lru_order.remove(pos);
+            }
         }
 
         self.vram_usage += vram_bytes;
@@ -587,6 +706,32 @@ struct Uniforms {
             aabb_min,
             aabb_max,
         });
+        self.lru_order.push_back(key);
+
+        // Evict oldest chunks until we're within budget
+        let mut evicted = Vec::new();
+        while self.vram_usage > CHUNK_MESH_VRAM_BUDGET {
+            if let Some(oldest) = self.lru_order.pop_front() {
+                // Don't evict the chunk we just inserted
+                if oldest == key { break; }
+                if let Some(mesh) = self.chunk_meshes.remove(&oldest) {
+                    self.vram_usage = self.vram_usage.saturating_sub(mesh.vram_bytes);
+                    evicted.push(oldest);
+                }
+            } else {
+                break;
+            }
+        }
+
+        if !evicted.is_empty() {
+            debug_log!(
+                "Game3DPipeline", "insert_chunk_mesh",
+                "LRU evicted {} chunks to stay within {:.0}MB VRAM budget",
+                evicted.len(),
+                CHUNK_MESH_VRAM_BUDGET as f64 / (1024.0 * 1024.0),
+            );
+        }
+        evicted
     }
     pub fn remove_chunk_meshes(&mut self, keys: &[(i32, i32, i32)]) {
         let mut freed = 0u64;
@@ -595,6 +740,10 @@ struct Uniforms {
             if let Some(mesh) = self.chunk_meshes.remove(key) {
                 freed   += mesh.vram_bytes;
                 removed += 1;
+                // Keep lru_order in sync (linear scan; only called on eviction)
+                if let Some(pos) = self.lru_order.iter().position(|k| k == key) {
+                    self.lru_order.remove(pos);
+                }
             }
         }
         if removed > 0 {
@@ -703,16 +852,18 @@ struct Uniforms {
 
     pub fn render(
         &mut self,
-        encoder:       &mut wgpu::CommandEncoder,
-        color_view:    &wgpu::TextureView,
-        device:        &wgpu::Device,
-        queue:         &wgpu::Queue,
-        camera:        &Camera,
-        width:         u32,
-        height:        u32,
-        atlas_view:    &wgpu::TextureView,
-        lighting_data: &[f32; 68],
-        gi_bind_group: &wgpu::BindGroup,
+        encoder:        &mut wgpu::CommandEncoder,
+        color_view:     &wgpu::TextureView,
+        device:         &wgpu::Device,
+        queue:          &wgpu::Queue,
+        camera:         &Camera,
+        width:          u32,
+        height:         u32,
+        atlas_view:     &wgpu::TextureView,
+        normal_atlas_view: &wgpu::TextureView,
+        lighting_data:  &[f32; 68],
+        gi_bind_group:  &wgpu::BindGroup,
+        shadow_vp:      &glam::Mat4,
     ) -> u128 {
         let t0 = Instant::now();
         self.ensure_depth(device, width, height);
@@ -729,7 +880,7 @@ struct Uniforms {
         }
         
         if self.shadow_texture.is_none() {
-            let shadow_size = 2048;
+            let shadow_size = 1024;
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Shadow Map"),
                 size: wgpu::Extent3d { width: shadow_size, height: shadow_size, depth_or_array_layers: 1 },
@@ -750,8 +901,9 @@ struct Uniforms {
             }));
         }
 
-        let vp      = camera.view_projection_matrix();
-        let frustum = FrustumPlanes::from_view_projection(&vp);
+        let vp              = camera.view_projection_matrix();
+        let frustum         = FrustumPlanes::from_view_projection(&vp);
+        let shadow_frustum  = FrustumPlanes::from_view_projection(shadow_vp);
 
         // Upload uniforms
         let uniform_bytes: &[u8] = unsafe {
@@ -796,6 +948,16 @@ struct Uniforms {
                                 self.shadow_sampler.as_ref().unwrap()
                             ),
                         },
+                        wgpu::BindGroupEntry {
+                            binding:  5,
+                            resource: wgpu::BindingResource::TextureView(normal_atlas_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding:  6,
+                            resource: wgpu::BindingResource::Sampler(
+                                self.atlas_sampler.as_ref().unwrap()
+                            ),
+                        },
                     ],
                 },
             ));
@@ -804,7 +966,37 @@ struct Uniforms {
         let bind_group = self.cached_bind_group.as_ref().unwrap();
 
         // Shadow pass
+        // {
+        //     let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        //         label: Some("Shadow Pass"),
+        //         color_attachments: &[],
+        //         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+        //             view: self.shadow_view.as_ref().unwrap(),
+        //             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+        //             stencil_ops: None,
+        //         }),
+        //         timestamp_writes: None,
+        //         occlusion_query_set: None,
+        //         multiview_mask: None,
+        //     });
+        //
+        //     shadow_pass.set_pipeline(&self.shadow_pipeline);
+        //     shadow_pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+        //     let mut shadow_calls = 0u32;
+        //     for mesh in self.chunk_meshes.values() {
+        //         if !shadow_frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) { continue; }
+        //         shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+        //         shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        //         shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        //         shadow_calls += 1;
+        //     }
+        //     self.last_shadow_draw_calls = shadow_calls;
+        // }
         {
+            let shadow_ext = 64.0f32; // 半径 shadow map coverage
+            let cam_chunk_x = (camera.position.x / config::chunk_size_x() as f32).floor() as i32;
+            let cam_chunk_z = (camera.position.z / config::chunk_size_z() as f32).floor() as i32;
+
             let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shadow Pass"),
                 color_attachments: &[],
@@ -817,16 +1009,31 @@ struct Uniforms {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            
+
             shadow_pass.set_pipeline(&self.shadow_pipeline);
             shadow_pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+            let mut shadow_draws: u32 = 0;
             for mesh in self.chunk_meshes.values() {
+                // Фрустум-куллинг (тот же что и в основном проходе)
+                if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) { continue; }
+                // Distance кулинг — только чанки в пределах shadow coverage
+                let mx = (mesh.aabb_min[0] + mesh.aabb_max[0]) * 0.5;
+                let mz = (mesh.aabb_min[2] + mesh.aabb_max[2]) * 0.5;
+                let dx = mx - camera.position.x;
+                let dz = mz - camera.position.z;
+                if dx * dx + dz * dz > shadow_ext * shadow_ext * 2.0 { continue; }
+
                 shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                shadow_draws += 1;
             }
+            flow_debug_log!(
+        "Game3DPipeline", "render",
+        "[PERF] shadow_pass: {} draws (culled from {})",
+        shadow_draws, self.chunk_meshes.len()
+    );
         }
-
         // Depth clear pass
         {
             // wgpu 22: RenderPassDescriptor needs multiview_mask
@@ -882,12 +1089,21 @@ struct Uniforms {
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_bind_group(1, gi_bind_group, &[]);
 
+        let mut draw_calls       = 0u32;
+        let mut visible_tris     = 0u32;
+        let mut visible_vram     = 0u64;
         for mesh in self.chunk_meshes.values() {
             if !frustum.intersects_aabb(mesh.aabb_min, mesh.aabb_max) { continue; }
             pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
             pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            draw_calls   += 1;
+            visible_tris += mesh.index_count / 3;
+            visible_vram += mesh.vram_bytes;
         }
+        self.last_draw_calls         = draw_calls;
+        self.last_visible_triangles  = visible_tris;
+        self.last_visible_vram_bytes = visible_vram;
 
         let render_us = t0.elapsed().as_micros();
         flow_debug_log!(
@@ -900,6 +1116,12 @@ struct Uniforms {
 
     pub fn vram_usage(&self) -> u64 { self.vram_usage }
     pub fn gpu_chunk_count(&self) -> usize { self.chunk_meshes.len() }
+
+    /// Depth buffer view — used by subsequent passes (e.g. volumetric lights)
+    /// for depth testing.  Returns `None` before the first frame.
+    pub fn depth_view(&self) -> Option<&wgpu::TextureView> {
+        self.depth_view.as_ref()
+    }
     // -----------------------------------------------------------------------
     // Outline pipeline
     // -----------------------------------------------------------------------

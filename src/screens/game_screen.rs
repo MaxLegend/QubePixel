@@ -28,6 +28,7 @@ use crate::core::config;
 use crate::core::radiance_cascades::system::RadianceCascadeSystemGpu;
 use crate::core::radiance_cascades::voxel_tex::fill_lut_from_closure;
 use crate::core::radiance_cascades::types::BlockProperties;
+use crate::core::volumetric_lights::{VolumetricLightPass, VolumetricLightData};
 
 const MAX_GPU_UPLOADS_PER_FRAME: usize = 32;
 
@@ -83,7 +84,29 @@ pub struct GameScreen {
     /// Whether the Block LUT has been populated (only needs to happen once).
     rc_lut_initialized: bool,
     rc_frame_counter: u32,
-    last_voxel_data: Option<(glam::IVec3, Vec<u16>)>,
+    last_voxel_data: Option<crate::core::gameobjects::world::VoxelUpdate>,
+    // -- Volumetric lights ---------------------------------------------------
+    volumetric_pass: Option<VolumetricLightPass>,
+    /// Cached resolved volumetric light data (rebuilt when emissive_blocks changes).
+    volumetric_lights: Vec<VolumetricLightData>,
+    /// Seconds elapsed since game start (for animated god rays).
+    elapsed_s: f32,
+    // -- RC / pipeline profiler accumulators ---------------------------------
+    /// Counts calls to rc.dispatch() — mirrors system.rs dispatch_counter
+    /// to determine full vs partial dispatch without exposing RC internals.
+    rc_dispatch_call_count:    u32,
+    last_rc_dispatch_time_us:  u128,
+    last_voxel_upload_time_us: u128,
+    last_rc_dispatched:        bool,
+    last_rc_was_full:          bool,
+    last_sky_render_us:        u128,
+    last_outline_us:           u128,
+    last_frame_total_us:       u128,
+    last_voxel_uploaded:       bool,
+    last_upload_bytes:         u64,
+    last_upload_throughput:    f64,   // MB/s (staging bandwidth)
+    /// Chunks evicted from GPU VRAM by LRU budget; passed to world worker next frame.
+    gpu_evicted_pending:       Vec<(i32, i32, i32)>,
 }
 
 impl GameScreen {
@@ -144,6 +167,21 @@ impl GameScreen {
             rc_lut_initialized: false,
             rc_frame_counter: 0,
             last_voxel_data: None,
+            volumetric_pass: None,
+            volumetric_lights: Vec::new(),
+            elapsed_s: 0.0,
+            rc_dispatch_call_count:    0,
+            last_rc_dispatch_time_us:  0,
+            last_voxel_upload_time_us: 0,
+            last_rc_dispatched:        false,
+            last_rc_was_full:          false,
+            last_sky_render_us:        0,
+            last_outline_us:           0,
+            last_frame_total_us:       0,
+            last_voxel_uploaded:       false,
+            last_upload_bytes:         0,
+            last_upload_throughput:    0.0,
+            gpu_evicted_pending:       Vec::new(),
         }
     }
 
@@ -209,6 +247,7 @@ impl Screen for GameScreen {
             cam_fwd,
             ray_dir,
             std::mem::take(&mut self.pending_block_ops),
+            std::mem::take(&mut self.gpu_evicted_pending),
         );
 
         // Non-blocking receive
@@ -216,7 +255,10 @@ impl Screen for GameScreen {
             self.target_block = result.raycast_result;
             // Извлекаем воксел-снапшот для RC (take, чтобы не клонировать)
             self.last_voxel_data = result.voxel_data.take();
-            self.physics_world.sync_chunks(&result.physics_chunks, &result.evicted);
+            self.physics_world.sync_chunks_ready(
+                std::mem::take(&mut result.physics_ready),
+                &result.evicted,
+            );
 
             // Capture profiler data from WorldResult
             self.last_gen_time_us     = result.gen_time_us;
@@ -232,26 +274,11 @@ impl Screen for GameScreen {
 
         let update_ms = t_update_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Update debug overlay
+        // Update debug overlay — minimal: FPS + GPU/CPU load + VRAM
         let vram = self.pipeline_3d.as_ref().map_or(0, |p| p.vram_usage());
-        let fwd = self.camera.forward();
-        let visible = self.pipeline_3d.as_ref().map_or(0, |p| {
-            let total = p.gpu_chunk_count() as u32;
-            total.saturating_sub(p.culled_last_frame)
-        });
-        let culled = self.pipeline_3d.as_ref().map_or(0, |p| p.culled_last_frame);
-
-        self.debug.update(
-            dt,
-            vram,
-            update_ms,
-            [self.camera.position.x, self.camera.position.y, self.camera.position.z],
-            [fwd.x, fwd.y, fwd.z],
-            self.world_worker.chunk_count(),
-            visible,
-            culled,
-            self.last_lod_counts,
-        );
+        // cpu_work_ms = update + last frame encode (best CPU estimate available on CPU timeline)
+        let cpu_work_ms = update_ms + self.last_frame_total_us as f64 / 1000.0;
+        self.debug.update(dt, vram, cpu_work_ms);
     }
 
     fn render(
@@ -264,7 +291,8 @@ impl Screen for GameScreen {
         width:   u32,
         height:  u32,
     ) {
-        // Lazy-init
+        let t_frame_start = Instant::now();
+
         // Lazy-init 3D pipeline
         if self.pipeline_3d.is_none() {
             self.pipeline_3d = Some(Game3DPipeline::new(device, queue, format, None));
@@ -279,16 +307,42 @@ impl Screen for GameScreen {
             self.rc_system = Some(rc);
         }
         self.atlas.ensure_gpu(device, queue);
-
+        // Lazy-init volumetric light pass
+        if self.volumetric_pass.is_none() {
+            self.volumetric_pass = Some(VolumetricLightPass::new(device, format));
+        }
         // --- Dispatch world result: eviction + submit to packing worker ---
-        if let Some(result) = self.pending_world_result.take() {
+        if let Some(mut result) = self.pending_world_result.take() {
             let pipeline = self.pipeline_3d.as_mut().unwrap();
 
             // Eviction
             if !result.evicted.is_empty() {
                 pipeline.remove_chunk_meshes(&result.evicted);
             }
-
+            // Rebuild volumetric light list when emissive blocks changed
+            if let Some(emissive) = result.emissive_blocks.take() {
+                let registry = &self.player.registry;
+                self.volumetric_lights = emissive
+                    .into_iter()
+                    .filter_map(|b| {
+                        let def = registry.get(b.block_id)?;
+                        if !def.volumetric.is_enabled() { return None; }
+                        Some(VolumetricLightData {
+                            position:       [b.wx, b.wy, b.wz],
+                            color:          def.emission.light_color,
+                            halo_enabled:   def.volumetric.halo_enabled,
+                            halo_radius:    def.volumetric.halo_radius,
+                            halo_intensity: def.volumetric.halo_intensity,
+                            ray_enabled:    def.volumetric.ray_enabled,
+                            ray_count:      def.volumetric.ray_count,
+                            ray_length:     def.volumetric.ray_length,
+                            ray_width:      def.volumetric.ray_width,
+                            ray_intensity:  def.volumetric.ray_intensity,
+                            ray_falloff:    def.volumetric.ray_falloff,
+                        })
+                    })
+                    .collect();
+            }
             // New meshes → UploadWorker (CPU packing)
             if !result.meshes.is_empty() {
                 let jobs: Vec<UploadJob> = result.meshes
@@ -319,12 +373,14 @@ impl Screen for GameScreen {
 
             if budget > 0 {
                 let t0 = Instant::now();
+                let mut total_bytes = 0u64;
 
                 for _ in 0..budget {
                     let r = self.upload_queue.pop_front().unwrap();
 
                     let vb_size = r.vertex_data.len() as u64;
                     let ib_size = r.index_data.len() as u64;
+                    total_bytes += vb_size + ib_size;
 
                     // Vertex buffer — mapped_at_creation skips write_buffer's
                     // internal staging allocation; we memcpy directly.
@@ -351,16 +407,26 @@ impl Screen for GameScreen {
                         .copy_from_slice(&r.index_data);
                     ib.unmap();
 
-                    pipeline.insert_chunk_mesh(
+                    let evicted = pipeline.insert_chunk_mesh(
                         r.key, vb, ib, r.index_count,
                         vb_size + ib_size,
                         r.aabb_min, r.aabb_max,
                     );
+                    self.gpu_evicted_pending.extend(evicted);
                 }
 
                 upload_time_us = t0.elapsed().as_micros();
                 upload_count = budget;
+                self.last_upload_bytes = total_bytes;
+                // Staging throughput: bytes / time (MB/s)
+                self.last_upload_throughput = if upload_time_us > 0 {
+                    total_bytes as f64 / upload_time_us as f64 / 1.048576 // µs → MB/s
+                } else {
+                    0.0
+                };
             } else {
+                self.last_upload_bytes      = 0;
+                self.last_upload_throughput = 0.0;
                 upload_time_us = 0;
                 upload_count = 0;
             }
@@ -376,10 +442,14 @@ impl Screen for GameScreen {
         self.camera.update_aspect(width, height);
 
         // Sky billboard rendering (sun/moon) — before 3D terrain
-        self.sky_renderer.render(
-            encoder, view, device, queue, format,
-            &self.camera, &self.day_night,
-        );
+        {
+            let t = Instant::now();
+            self.sky_renderer.render(
+                encoder, view, device, queue, format,
+                &self.camera, &self.day_night,
+            );
+            self.last_sky_render_us = t.elapsed().as_micros();
+        }
 
         // ---- Radiance Cascades: throttled GI update ----
         // RC dispatches every RC_THROTTLE frames — GI changes slowly,
@@ -390,11 +460,32 @@ impl Screen for GameScreen {
         if let Some(ref mut rc) = self.rc_system {
             rc.recenter(self.camera.position);
 
-            // Upload voxel texture only when world worker sent fresh data
-            if let Some((ref origin, ref data)) = self.last_voxel_data {
-                rc.voxel_builder_mut().set_data_raw(*origin, data.clone());
-                rc.upload_voxel_texture(queue);
-                flow_debug_log!("GameScreen", "render", "Voxel texture uploaded to GPU");
+            // Voxel texture upload — now uses dirty-region tracking (Variant B).
+            // Full = 32 MB only when camera crosses chunk boundary.
+            // Partial = N × 8 KB for dirty chunks only (common case).
+            if let Some(update) = self.last_voxel_data.take() {
+                use crate::core::gameobjects::world::VoxelUpdate;
+                let t_vox = Instant::now();
+                match update {
+                    VoxelUpdate::Full { origin, data } => {
+                        rc.voxel_builder_mut().set_data_raw(origin, data);
+                        rc.upload_voxel_texture(queue);
+                        debug_log!("GameScreen", "render",
+                            "Voxel FULL upload: origin=({},{},{})",
+                            origin.x, origin.y, origin.z);
+                    }
+                    VoxelUpdate::Partial { origin: _, regions } => {
+                        for region in &regions {
+                            rc.upload_voxel_region(queue, region);
+                        }
+                        debug_log!("GameScreen", "render",
+                            "Voxel PARTIAL upload: {} regions", regions.len());
+                    }
+                }
+                self.last_voxel_upload_time_us = t_vox.elapsed().as_micros();
+                self.last_voxel_uploaded = true;
+            } else {
+                self.last_voxel_uploaded = false;
             }
 
             // Block LUT — once at startup
@@ -425,30 +516,93 @@ impl Screen for GameScreen {
 
             // Dispatch RC pipeline only every RC_THROTTLE frames
             if self.rc_frame_counter % RC_THROTTLE == 0 {
+                self.rc_dispatch_call_count = self.rc_dispatch_call_count.wrapping_add(1);
+                // Mirror system.rs dispatch_counter logic: full every 4 calls.
+                self.last_rc_was_full = self.rc_dispatch_call_count % 4 == 0;
+
                 let sky_brightness = self.day_night.sky_brightness();
+                let t_rc = Instant::now();
                 rc.dispatch(encoder, queue, sky_brightness);
+                self.last_rc_dispatch_time_us = t_rc.elapsed().as_micros();
+                self.last_rc_dispatched = true;
+
                 flow_debug_log!("GameScreen", "render",
-            "RC dispatched at frame {}", self.rc_frame_counter);
+                    "RC dispatched at frame {} [{:.2}ms, {}]",
+                    self.rc_frame_counter,
+                    self.last_rc_dispatch_time_us as f64 / 1000.0,
+                    if self.last_rc_was_full { "FULL" } else { "partial" });
+            } else {
+                self.last_rc_dispatched = false;
             }
         }
 
         // 3D render — pack lighting uniforms and pass to pipeline
         let atlas_view = self.atlas.texture_view().unwrap();
+        let normal_atlas_view = self.atlas.normal_texture_view().unwrap();
         let vp = self.camera.view_projection_matrix();
 
+        // let sun_dir = self.day_night.sun_direction();
+        // let center = self.camera.position;
+        // let dist = 100.0;
+        // let up = if sun_dir.y.abs() > 0.99 { glam::Vec3::Z } else { glam::Vec3::Y };
+        // let shadow_view = glam::Mat4::look_at_rh(
+        //     center + sun_dir * dist,
+        //     center,
+        //     up,
+        // );
+        // let ext = 64.0;
+        // let shadow_proj = glam::Mat4::orthographic_rh(-ext, ext, -ext, ext, 1.0, 200.0);
+        // let shadow_view_proj = shadow_proj * shadow_view;
         let sun_dir = self.day_night.sun_direction();
         let center = self.camera.position;
         let dist = 100.0;
-        let up = if sun_dir.y.abs() > 0.99 { glam::Vec3::Z } else { glam::Vec3::Y };
+        let up_hint = if sun_dir.y.abs() > 0.99 { glam::Vec3::Z } else { glam::Vec3::Y };
+        let ext = 64.0_f32;
+
+        // --- Texel snapping: align shadow map texels with voxel grid ---
+        // Shadow map is 1024×1024 covering 128×128 world units.
+        // Each texel = 0.125 world units.  MUST match shadow_size in
+        // Game3DPipeline::new() where the shadow texture is created.
+        let shadow_map_size = 1024.0_f32;
+        let texel_size = 2.0 * ext / shadow_map_size; // 0.125
+
+        // Light-space basis vectors (matching look_at_rh internals).
+        // look_at_rh computes: fwd = normalize(target-eye), right = cross(fwd, up), up' = cross(right, fwd).
+        let light_fwd = -sun_dir;
+        let light_right = light_fwd.cross(up_hint).normalize();
+        let light_up = light_right.cross(light_fwd).normalize();
+
+        // Project camera center onto light-space axes.
+        let c_right = center.dot(light_right);
+        let c_up = center.dot(light_up);
+        let c_fwd = center.dot(light_fwd);
+
+        // Snap perpendicular axes to texel grid.
+        // The +0.5 offset ensures integer world coordinates map to texel
+        // CENTERS (not boundaries), so block edges align with texel edges.
+        let snapped_right = ((c_right / texel_size).floor() + 0.5) * texel_size;
+        let snapped_up = ((c_up / texel_size).floor() + 0.5) * texel_size;
+
+        // Reconstruct snapped center in world space (depth/forward unchanged).
+        let snapped_center = light_right * snapped_right
+            + light_up * snapped_up
+            + light_fwd * c_fwd;
+
         let shadow_view = glam::Mat4::look_at_rh(
-            center + sun_dir * dist,
-            center,
-            up,
+            snapped_center + sun_dir * dist,
+            snapped_center,
+            light_up,
         );
-        let ext = 64.0;
         let shadow_proj = glam::Mat4::orthographic_rh(-ext, ext, -ext, ext, 1.0, 200.0);
         let shadow_view_proj = shadow_proj * shadow_view;
 
+        flow_debug_log!(
+            "GameScreen", "render",
+            "[Shadow] center=({:.2},{:.2},{:.2}) snapped=({:.2},{:.2},{:.2}) texel={:.3}",
+            center.x, center.y, center.z,
+            snapped_center.x, snapped_center.y, snapped_center.z,
+            texel_size
+        );
         let lighting_data = pack_lighting_uniforms(
             &vp,
             self.camera.position,
@@ -493,37 +647,87 @@ impl Screen for GameScreen {
 
         let render_us = pipeline.render(
             encoder, view, device, queue, &self.camera, width, height,
-            atlas_view, &lighting_data, gi_bg,
+            atlas_view, normal_atlas_view, &lighting_data, gi_bg,
+            &shadow_view_proj,
         );
+        // -- Volumetric lights (halos + god rays) — additive pass after 3D --
+        if let (Some(ref mut vol_pass), Some(depth_view)) = (
+            self.volumetric_pass.as_mut(),
+            pipeline.depth_view(),
+        ) {
+            let vp        = self.camera.view_projection_matrix();
+            let cam_right = self.camera.right();
+            let cam_fwd   = self.camera.forward();
+            let cam_up    = cam_right.cross(cam_fwd).normalize();
 
+            vol_pass.update(
+                device, queue,
+                &self.volumetric_lights,
+                &vp,
+                cam_right,
+                cam_up,
+                self.elapsed_s,
+            );
+            vol_pass.render(encoder, view, depth_view);
+        }
         // Block outline
-        pipeline.render_outline(
-            encoder, view, device, queue, &self.camera, width, height,
-            self.target_block.map(|r| r.block_pos),
-        );
+        {
+            let t = Instant::now();
+            pipeline.render_outline(
+                encoder, view, device, queue, &self.camera, width, height,
+                self.target_block.map(|r| r.block_pos),
+            );
+            self.last_outline_us = t.elapsed().as_micros();
+        }
+
+        self.last_frame_total_us = t_frame_start.elapsed().as_micros();
 
         // Feed profiler
         let vram = pipeline.vram_usage();
+        let visible_chunks = pipeline.gpu_chunk_count() as u32
+            - pipeline.culled_last_frame;
+        let draw_calls         = pipeline.last_draw_calls;
+        let shadow_draw_calls  = pipeline.last_shadow_draw_calls;
+        let visible_triangles  = pipeline.last_visible_triangles;
+        let visible_vram_bytes = pipeline.last_visible_vram_bytes;
         self.profiler.feed(ProfilerFrame {
-            gen_time_us:     self.last_gen_time_us,
-            mesh_time_us:    self.last_mesh_time_us,
-            upload_time_us:  upload_time_us,
-            render_time_us:  render_us,
-            worker_total_us: self.last_worker_total_us,
-            gen_count:       self.last_gen_count,
-            dirty_count:     self.last_dirty_count,
-            upload_count:    upload_count,
-            total_chunks:    self.world_worker.chunk_count(),
-            visible_chunks:  pipeline.gpu_chunk_count() as u32
-                - pipeline.culled_last_frame,
-            culled_chunks:   pipeline.culled_last_frame,
-            lod0_count:      self.last_lod_counts[0],
-            lod1_count:      self.last_lod_counts[1],
-            lod2_count:      self.last_lod_counts[2],
-            worker_pending:  self.last_worker_pending,
-            upload_pending:  self.upload_worker.pending_count(),
-            gpu_queue_depth: self.upload_queue.len(),
-            vram_bytes:      vram,
+            fps:                  self.debug.fps,
+            frame_total_us:       self.last_frame_total_us,
+            gen_time_us:          self.last_gen_time_us,
+            gen_count:            self.last_gen_count,
+            mesh_time_us:         self.last_mesh_time_us,
+            dirty_count:          self.last_dirty_count,
+            upload_time_us:       upload_time_us,
+            upload_count:         upload_count,
+            voxel_upload_time_us: self.last_voxel_upload_time_us,
+            voxel_uploaded:       self.last_voxel_uploaded,
+            sky_render_us:        self.last_sky_render_us,
+            rc_dispatch_time_us:  self.last_rc_dispatch_time_us,
+            rc_dispatched:        self.last_rc_dispatched,
+            rc_was_full:          self.last_rc_was_full,
+            render_3d_us:         render_us,
+            outline_us:           self.last_outline_us,
+            total_chunks:         self.world_worker.chunk_count(),
+            visible_chunks,
+            culled_chunks:        pipeline.culled_last_frame,
+            lod0_count:           self.last_lod_counts[0],
+            lod1_count:           self.last_lod_counts[1],
+            lod2_count:           self.last_lod_counts[2],
+            worker_pending:       self.last_worker_pending,
+            upload_pending:       self.upload_worker.pending_count(),
+            gpu_queue_depth:      self.upload_queue.len(),
+            vram_bytes:              vram,
+            draw_calls,
+            shadow_draw_calls,
+            visible_triangles,
+            visible_vram_bytes,
+            upload_bytes:            self.last_upload_bytes,
+            upload_throughput_mb_s:  self.last_upload_throughput,
+            cam_pos:              [
+                self.camera.position.x,
+                self.camera.position.y,
+                self.camera.position.z,
+            ],
         });
     }
 

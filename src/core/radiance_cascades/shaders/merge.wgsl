@@ -86,30 +86,80 @@ const TRILINEAR_FIX_DAMPING:   f32 = 0.25;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute a single Fibonacci sphere direction on the GPU.
-fn fibonacci_dir_gpu(idx: u32, n: u32) -> vec3<f32> {
-    let inv_n = 1.0 / f32(n);
-    let y = 1.0 - 2.0 * (f32(idx) + 0.5) * inv_n;
-    let r = sqrt(max(0.0, 1.0 - y * y));
-    let theta = GOLDEN_ANGLE * f32(idx);
-    return vec3<f32>(cos(theta) * r, y, sin(theta) * r);
+/// Compute a single cube-face subdivision direction on the GPU.
+/// Matches the CPU cube_face_directions(subdiv) function in sampling.rs.
+fn cube_face_dir_gpu(idx: u32, subdiv: u32) -> vec3<f32> {
+    let cells_per_face = subdiv * subdiv;
+    let face_idx = idx / cells_per_face;
+    let cell_idx  = idx % cells_per_face;
+    let cu = cell_idx % subdiv;
+    let cv = cell_idx / subdiv;
+    let u = 2.0 * (f32(cu) + 0.5) / f32(subdiv) - 1.0;
+    let v = 2.0 * (f32(cv) + 0.5) / f32(subdiv) - 1.0;
+
+    var pt: vec3<f32>;
+    if (face_idx == 0u) {
+        pt = vec3<f32>( 1.0, u, v);   // +X
+    } else if (face_idx == 1u) {
+        pt = vec3<f32>(-1.0, u, v);   // −X
+    } else if (face_idx == 2u) {
+        pt = vec3<f32>(u,  1.0, v);   // +Y
+    } else if (face_idx == 3u) {
+        pt = vec3<f32>(u, -1.0, v);   // −Y
+    } else if (face_idx == 4u) {
+        pt = vec3<f32>(u, v,  1.0);   // +Z
+    } else {
+        pt = vec3<f32>(u, v, -1.0);   // −Z
+    };
+
+    return normalize(pt);
 }
 
-/// Find the index of the nearest Fibonacci direction in a set of `n`
-/// directions to the given `target` direction. Linear scan.
-fn find_nearest_dir(targetind: vec3<f32>, n: u32) -> u32 {
-    var best_idx: u32 = 0u;
-    var best_dot: f32 = -2.0;
-    for (var i: u32 = 0u; i < n; i = i + 1u) {
-        let d = dot(targetind, fibonacci_dir_gpu(i, n));
-        if (d > best_dot) {
-            best_dot = d;
-            best_idx = i;
-        }
+/// Derive the subdivision level from ray count.
+/// ray_count = 6 * subdiv^2  →  subdiv = sqrt(ray_count / 6)
+fn derive_subdiv(ray_count: u32) -> u32 {
+    var s: u32 = 1u;
+    for (var i: u32 = 1u; i <= 10u; i = i + 1u) {
+        if (6u * i * i >= ray_count) { s = i; break; }
     }
-    return best_idx;
+    return s;
 }
 
+/// Analytically find the nearest cube-face direction index.
+/// O(1) — projects target onto the dominant cube face and maps to cell.
+/// Matches the CPU nearest_cube_face_dir_index() function in sampling.rs.
+fn nearest_cube_face_dir(targetcuve: vec3<f32>, subdiv: u32) -> u32 {
+    let t = normalize(targetcuve);
+    let ax = abs(t.x);
+    let ay = abs(t.y);
+    let az = abs(t.z);
+
+    var face_idx: u32 = 0u;
+    var u: f32 = 0.0;
+    var v: f32 = 0.0;
+
+    if (ax >= ay && ax >= az) {
+        if (t.x >= 0.0) { face_idx = 0u; } else { face_idx = 1u; }
+        u = t.y;
+        v = t.z;
+    } else if (ay >= az) {
+        if (t.y >= 0.0) { face_idx = 2u; } else { face_idx = 3u; }
+        u = t.x;
+        v = t.z;
+    } else {
+        if (t.z >= 0.0) { face_idx = 4u; } else { face_idx = 5u; }
+        u = t.x;
+        v = t.y;
+    };
+
+    // Map [-1, 1] → cell index [0, subdiv-1]
+    var cu: u32 = u32((u + 1.0) * 0.5 * f32(subdiv));
+    var cv: u32 = u32((v + 1.0) * 0.5 * f32(subdiv));
+    if (cu >= subdiv) { cu = subdiv - 1u; }
+    if (cv >= subdiv) { cv = subdiv - 1u; }
+
+    return face_idx * subdiv * subdiv + cv * subdiv + cu;
+}
 // ---------------------------------------------------------------------------
 // Compute entry point
 // ---------------------------------------------------------------------------
@@ -173,13 +223,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // ---- Child ray direction (Fibonacci) ----
-    let child_dir = fibonacci_dir_gpu(ray_idx, c_rc);
+    // ---- Child ray direction (cube-face subdivision) ----
+    let child_subdiv = derive_subdiv(c_rc);
+    let child_dir = cube_face_dir_gpu(ray_idx, child_subdiv);
     let child_dir_n = normalize(child_dir);
 
-    // ---- Find nearest parent ray direction ----
+    // ---- Find nearest parent ray direction (cube-face analytical) ----
     let p_rc: u32 = merge_params.parent_ray_count;
-    let nearest_parent_ray: u32 = find_nearest_dir(child_dir_n, p_rc);
+    let parent_subdiv = derive_subdiv(p_rc);
+    let nearest_parent_ray: u32 = nearest_cube_face_dir(child_dir_n, parent_subdiv);
 
     // ---- Trilinear interpolation of 8 parent corners ----
     // Accumulate weighted parent interval data.
@@ -188,6 +240,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var interp_tau:    f32 = 0.0;
     var interp_dist:   f32 = 0.0;
     var total_weight:  f32 = 0.0;
+    var interp_pre_hit: f32 = 0.0;
 
     let fx = parent_frac.x;
     let fy = parent_frac.y;
@@ -261,6 +314,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 interp_tau  = interp_tau  + weight * p_iv.radiance_out.w;
                 interp_dist = interp_dist + weight * p_iv.direction_length.w;
                 total_weight = total_weight + weight;
+                interp_pre_hit = interp_pre_hit + weight * p_iv.radiance_in.a;
             }
         }
     }
@@ -276,7 +330,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     interp_out  = interp_out  * inv_w;
     interp_tau  = interp_tau  * inv_w;
     interp_dist = interp_dist * inv_w;
-
+    interp_pre_hit = interp_pre_hit * inv_w;
     // ---- Merge: child (near) + interpolated parent (far) ----
     // M.radiance_in  = child.radiance_in + exp(-child.tau) * parent_interp.radiance_in
     // M.radiance_out = parent_interp.radiance_out  (far-end emission)
@@ -286,16 +340,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let transmittance = exp(-min(child_iv.radiance_out.w, 80.0));
 
-    let merged_in = vec3<f32>(
+    let merged_in = clamp(vec3<f32>(
         child_iv.radiance_in.x + transmittance * interp_in.x,
         child_iv.radiance_in.y + transmittance * interp_in.y,
         child_iv.radiance_in.z + transmittance * interp_in.z
+        ),
+        vec3<f32>(0.0),
+        vec3<f32>(2.0)
     );
 
     let merged_tau = min(child_iv.radiance_out.w + interp_tau, merge_params.opaque_threshold);
 
+    let merged_pre_hit = child_iv.radiance_in.a + interp_pre_hit;
+
     let result = RadianceInterval(
-        vec4<f32>(merged_in, 0.0),
+        vec4<f32>(merged_in, merged_pre_hit),
         vec4<f32>(interp_out, merged_tau),
         vec4<f32>(child_dir_n, child_iv.direction_length.w + interp_dist)
     );

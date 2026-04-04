@@ -15,16 +15,21 @@ use crate::debug_log;
 
 use super::types::BlockProperties;
 
+/// Granularity of voxel-texture partial uploads (16³ sub-regions).
+/// Independent of the game chunk size — the GPU upload tile is always 16 blocks.
+const VOXEL_REGION_SIZE: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /// Size of the voxel texture per axis (blocks).
 /// Covers VOXEL_TEX_HALF_SIZE blocks in each direction from the camera.
-pub const VOXEL_TEX_SIZE: u32 = 128;
+/// 256³ = ±128 blocks = 8 chunks per side — enough for all 5 cascade levels.
+pub const VOXEL_TEX_SIZE: u32 = 256;
 
 /// Half-size: camera sits at the center, coverage = VOXEL_TEX_SIZE/2 blocks.
-pub const VOXEL_TEX_HALF_SIZE: u32 = 64;
+pub const VOXEL_TEX_HALF_SIZE: u32 = 128;
 
 /// Maximum number of block types.
 pub const MAX_BLOCK_TYPES: u32 = 256;
@@ -75,20 +80,26 @@ impl VoxelTextureBuilder {
 
     /// Recenter the voxel texture around a new camera position.
     ///
-    /// Sets the world_origin such that the camera sits at the center of
-    /// the texture. Existing data is cleared (all set to sentinel).
-    pub fn recenter(&mut self, camera_pos: Vec3) {
-        self.camera_pos = camera_pos;
-        let cx = camera_pos.x.round() as i32;
-        let cy = camera_pos.y.round() as i32;
-        let cz = camera_pos.z.round() as i32;
-        self.world_origin = glam::IVec3::new(
+    /// Origin is snapped to the VOXEL_REGION_SIZE (16-block) grid so it only changes
+    /// when the camera crosses a 16-block boundary — not every block-step.
+    /// Clears data and returns true only when the origin actually changed.
+    pub fn recenter(&mut self, camera_pos: Vec3) -> bool {
+        let cs = VOXEL_REGION_SIZE as i32;
+        let cx = (camera_pos.x.floor() as i32).div_euclid(cs) * cs;
+        let cy = (camera_pos.y.floor() as i32).div_euclid(cs) * cs;
+        let cz = (camera_pos.z.floor() as i32).div_euclid(cs) * cs;
+        let new_origin = glam::IVec3::new(
             cx - VOXEL_TEX_HALF_SIZE as i32,
             cy - VOXEL_TEX_HALF_SIZE as i32,
             cz - VOXEL_TEX_HALF_SIZE as i32,
         );
-        // Clear all data
+        if new_origin == self.world_origin {
+            return false;
+        }
+        self.world_origin = new_origin;
+        self.camera_pos   = camera_pos;
         self.data.fill(0xFFFF);
+        true
     }
 
     /// Convert world block coordinates to voxel texture coordinates.
@@ -133,6 +144,55 @@ impl VoxelTextureBuilder {
             })
             .unwrap_or(0xFFFF)
     }
+    /// Fill a single 16³ chunk region from a closure.
+    ///
+    /// `wx_base, wy_base, wz_base` — world-space block origin of the chunk.
+    /// `get_block(bx, by, bz)` — returns block ID for local coords (0..16).
+    ///
+    /// Returns the texel origin `(tx, ty, tz)` of the updated region,
+    /// or None if the chunk is outside the current texture bounds.
+    pub fn fill_chunk_region_fn<F>(
+        &mut self,
+        wx_base: i32, wy_base: i32, wz_base: i32,
+        get_block: F,
+    ) -> Option<(u32, u32, u32)>
+    where F: Fn(usize, usize, usize) -> u8
+    {
+        let (tx, ty, tz) = self.world_to_texel(wx_base, wy_base, wz_base)?;
+        let cs = VOXEL_REGION_SIZE as u32;
+        if tx + cs > VOXEL_TEX_SIZE || ty + cs > VOXEL_TEX_SIZE || tz + cs > VOXEL_TEX_SIZE {
+            return None;
+        }
+        let w  = VOXEL_TEX_SIZE as usize;
+        let cs = VOXEL_REGION_SIZE;
+        for bz in 0..cs {
+            for by in 0..cs {
+                let dst = tx as usize + (ty as usize + by) * w + (tz as usize + bz) * w * w;
+                for bx in 0..cs {
+                    self.data[dst + bx] = get_block(bx, by, bz) as u16;
+                }
+            }
+        }
+        Some((tx, ty, tz))
+    }
+
+    /// Extract a 16³ chunk region into a flat Vec<u16> ready for write_texture.
+    ///
+    /// Layout: `out[dx + dy*16 + dz*16*16]`, matching the GPU texture row layout
+    /// expected by write_texture with bytes_per_row = 16 * 2.
+    pub fn extract_chunk_region(&self, tx: u32, ty: u32, tz: u32) -> Vec<u16> {
+        let cs = VOXEL_REGION_SIZE;
+        let w  = VOXEL_TEX_SIZE as usize;
+        let mut out = Vec::with_capacity(cs * cs * cs);
+        for dz in 0..cs {
+            for dy in 0..cs {
+                let src = tx as usize + (ty as usize + dy) * w + (tz as usize + dz) * w * w;
+                out.extend_from_slice(&self.data[src..src + cs]);
+            }
+        }
+        out
+    }
+
     /// Напрямую задать данные воксел-буфера и его мировое начало.
     /// Используется для передачи данных из WorldWorker без копирования чанков.
     pub fn set_data_raw(&mut self, origin: glam::IVec3, data: Vec<u16>) {
@@ -284,17 +344,16 @@ mod tests {
     #[test]
     fn test_voxel_texture_builder_new() {
         let vtb = VoxelTextureBuilder::new();
-        assert_eq!(vtb.data().len(), 128 * 128 * 128);
-        // All should be sentinel (0xFFFF)
+        let expected = (VOXEL_TEX_SIZE as usize).pow(3);
+        assert_eq!(vtb.data().len(), expected);
         assert!(vtb.data().iter().all(|&b| b == 0xFFFF));
     }
 
     #[test]
     fn test_voxel_texture_set_get() {
         let mut vtb = VoxelTextureBuilder::new();
-        // Recenter so we know the mapping
-        vtb.recenter(Vec3::new(64.0, 64.0, 64.0));
-        // Origin should be at (0, 0, 0)
+        // Camera at HALF_SIZE so origin = (0,0,0)
+        vtb.recenter(Vec3::new(VOXEL_TEX_HALF_SIZE as f32, VOXEL_TEX_HALF_SIZE as f32, VOXEL_TEX_HALF_SIZE as f32));
         assert_eq!(vtb.world_origin(), glam::IVec3::new(0, 0, 0));
 
         // Set block at world (10, 20, 30) = texel (10, 20, 30)
@@ -308,15 +367,14 @@ mod tests {
     #[test]
     fn test_voxel_texture_out_of_bounds() {
         let mut vtb = VoxelTextureBuilder::new();
-        vtb.recenter(Vec3::new(64.0, 64.0, 64.0));
+        let h = VOXEL_TEX_HALF_SIZE as f32;
+        vtb.recenter(Vec3::new(h, h, h));
+        let s = VOXEL_TEX_SIZE as i32;
 
-        // Before origin
         assert_eq!(vtb.get_block(-1, 0, 0), 0xFFFF);
-        // After origin + size
-        assert_eq!(vtb.get_block(128, 0, 0), 0xFFFF);
-        // Inside
-        vtb.set_block(127, 127, 127, 99);
-        assert_eq!(vtb.get_block(127, 127, 127), 99);
+        assert_eq!(vtb.get_block(s, 0, 0), 0xFFFF); // just past end
+        vtb.set_block(s - 1, s - 1, s - 1, 99);
+        assert_eq!(vtb.get_block(s - 1, s - 1, s - 1), 99);
     }
 
     #[test]
@@ -330,18 +388,19 @@ mod tests {
         // Previous block should be cleared
         assert_eq!(vtb.get_block(10, 20, 30), 0xFFFF);
 
-        // New origin should be at (136, 136, 136)
+        // origin = round(200) - VOXEL_TEX_HALF_SIZE = 200 - 128 = 72
         let origin = vtb.world_origin();
-        assert_eq!(origin.x, 136);
-        assert_eq!(origin.y, 136);
-        assert_eq!(origin.z, 136);
+        let expected = 200 - VOXEL_TEX_HALF_SIZE as i32;
+        assert_eq!(origin.x, expected);
+        assert_eq!(origin.y, expected);
+        assert_eq!(origin.z, expected);
     }
 
     #[test]
     fn test_voxel_texture_data_bytes() {
         let vtb = VoxelTextureBuilder::new();
-        // 128^3 * 2 bytes = 4,194,304 bytes = 4 MB
-        assert_eq!(vtb.data_bytes(), 4_194_304);
+        let expected = (VOXEL_TEX_SIZE as usize).pow(3) * 2;
+        assert_eq!(vtb.data_bytes(), expected);
     }
 
     #[test]

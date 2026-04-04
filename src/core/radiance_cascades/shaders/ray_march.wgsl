@@ -47,7 +47,7 @@ struct CascadeParams {
     grid_origin_z:     f32,
     opaque_threshold:  f32,
     sky_brightness:    f32,
-    _pad:              f32,
+    cascade_level:     u32,  // 0 = C0 (finest), NUM_CASCADES-1 = C4 (coarsest)
 };
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ struct CascadeParams {
 // ---------------------------------------------------------------------------
 
 const WORKGROUP_SIZE:      u32 = 64u;
-const VOXEL_TEX_SIZE:      u32 = 128u;
+const VOXEL_TEX_SIZE:      u32 = 256u; // must match VoxelTextureBuilder::VOXEL_TEX_SIZE
 const UNLOADED_SENTINEL:   u32 = 0xFFFFu;
 const GOLDEN_ANGLE:        f32 = 2.39996323;
 const EPSILON:             f32 = 1.0e-8;
@@ -88,8 +88,8 @@ fn read_block_props(block_id: u32) -> vec4<f32> {
 /// Sample block ID at a voxel coordinate within the 3D texture.
 /// Returns 0 (air) for out-of-bounds or unloaded texels.
 fn sample_voxel_block(vx: i32, vy: i32, vz: i32) -> u32 {
-    if (vx < 0 || vy < 0 || vz < 0 ||
-        vx >= 128 || vy >= 128 || vz >= 128) {
+    let sz = i32(VOXEL_TEX_SIZE);
+    if (vx < 0 || vy < 0 || vz < 0 || vx >= sz || vy >= sz || vz >= sz) {
         return 0u;
     }
     let raw = textureLoad(voxel_tex, vec3<i32>(vx, vy, vz), 0).r;
@@ -99,23 +99,58 @@ fn sample_voxel_block(vx: i32, vy: i32, vz: i32) -> u32 {
     return raw;
 }
 
-/// Compute a single Fibonacci sphere direction on the GPU.
-/// Used as fallback when ray_idx exceeds the pre-uploaded CPU direction buffer.
-fn fibonacci_dir_gpu(idx: u32, n: u32) -> vec3<f32> {
-    let inv_n = 1.0 / f32(n);
-    let y = 1.0 - 2.0 * (f32(idx) + 0.5) * inv_n;
-    let r = sqrt(max(0.0, 1.0 - y * y));
-    let theta = GOLDEN_ANGLE * f32(idx);
-    return vec3<f32>(cos(theta) * r, y, sin(theta) * r);
+/// Compute a single cube-face subdivision direction on the GPU.
+/// Matches the CPU cube_face_directions(subdiv) function in sampling.rs.
+///
+/// Face order: 0=+X, 1=−X, 2=+Y, 3=−Y, 4=+Z, 5=−Z
+/// Each face has subdiv×subdiv cells. Total directions = 6 * subdiv * subdiv.
+fn cube_face_dir_gpu(idx: u32, subdiv: u32) -> vec3<f32> {
+    let cells_per_face = subdiv * subdiv;
+    let face_idx = idx / cells_per_face;
+    let cell_idx  = idx % cells_per_face;
+    let cu = cell_idx % subdiv;
+    let cv = cell_idx / subdiv;
+    let u = 2.0 * (f32(cu) + 0.5) / f32(subdiv) - 1.0;
+    let v = 2.0 * (f32(cv) + 0.5) / f32(subdiv) - 1.0;
+
+    // Construct point on cube face
+    var pt: vec3<f32>;
+    if (face_idx == 0u) {
+        pt = vec3<f32>( 1.0, u, v);   // +X
+    } else if (face_idx == 1u) {
+        pt = vec3<f32>(-1.0, u, v);   // −X
+    } else if (face_idx == 2u) {
+        pt = vec3<f32>(u,  1.0, v);   // +Y
+    } else if (face_idx == 3u) {
+        pt = vec3<f32>(u, -1.0, v);   // −Y
+    } else if (face_idx == 4u) {
+        pt = vec3<f32>(u, v,  1.0);   // +Z
+    } else {
+        pt = vec3<f32>(u, v, -1.0);   // −Z
+    };
+
+    return normalize(pt);
 }
+
+/// Derive the subdivision level from ray count.
+/// ray_count = 6 * subdiv^2  →  subdiv = sqrt(ray_count / 6)
+fn derive_subdiv(ray_count: u32) -> u32 {
+    // Exact for our cascade configs: 6, 24, 54, 96, 150
+    var s: u32 = 1u;
+    for (var i: u32 = 1u; i <= 10u; i = i + 1u) {
+        if (6u * i * i >= ray_count) { s = i; break; }
+    }
+    return s;
+}
+
 
 // ---------------------------------------------------------------------------
 // Compute entry point
 // ---------------------------------------------------------------------------
 
 @compute @workgroup_size(WORKGROUP_SIZE)
+
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    // ---- Flat index decomposition ----
     let flat_idx: u32 = gid.x;
     let total_probes: u32 = params.grid_size * params.grid_size * params.grid_size;
     let total: u32 = total_probes * params.ray_count;
@@ -133,7 +168,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let probe_iy: u32 = (probe_flat / gs) % gs;
     let probe_iz: u32 = probe_flat / (gs * gs);
 
-    // ---- Probe world position ----
     let grid_origin = vec3<f32>(
         params.grid_origin_x,
         params.grid_origin_y,
@@ -143,16 +177,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + vec3<f32>(f32(probe_ix), f32(probe_iy), f32(probe_iz))
         * params.grid_spacing;
 
-    // ---- Ray direction ----
     var ray_dir: vec3<f32>;
     let num_stored: u32 = arrayLength(&ray_directions);
     if (ray_idx < num_stored && num_stored > 0u) {
         ray_dir = normalize(ray_directions[ray_idx].xyz);
     } else {
-        ray_dir = fibonacci_dir_gpu(ray_idx, rays_per_probe);
+        let subdiv = derive_subdiv(rays_per_probe);
+        ray_dir = cube_face_dir_gpu(ray_idx, subdiv);
     }
 
-    // ---- Ray origin (offset from probe) ----
     let ray_origin = probe_pos + ray_dir * params.ray_start;
     let voxel_origin = vec3<f32>(
         params.voxel_origin_x,
@@ -160,7 +193,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         params.voxel_origin_z
     );
 
-    // ---- DDA initialization (Amanatides-Woo) ----
     let local_pos = ray_origin - voxel_origin;
 
     var voxel = vec3<i32>(
@@ -169,22 +201,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         i32(floor(local_pos.z))
     );
 
-    // Step direction: +1 or -1 per axis
     let step_x: i32 = select(1, -1, ray_dir.x < 0.0);
     let step_y: i32 = select(1, -1, ray_dir.y < 0.0);
     let step_z: i32 = select(1, -1, ray_dir.z < 0.0);
 
-    // tDelta: distance between consecutive voxel boundaries along ray per axis
     let t_delta = vec3<f32>(
         select(1.0e10, abs(1.0 / ray_dir.x), abs(ray_dir.x) > EPSILON),
         select(1.0e10, abs(1.0 / ray_dir.y), abs(ray_dir.y) > EPSILON),
         select(1.0e10, abs(1.0 / ray_dir.z), abs(ray_dir.z) > EPSILON)
     );
 
-    // tMax: distance from ray_origin to next voxel boundary per axis
     var t_max = vec3<f32>(0.0, 0.0, 0.0);
 
-    // X axis
     if (abs(ray_dir.x) > EPSILON) {
         if (ray_dir.x > 0.0) {
             t_max.x = (f32(voxel.x + 1) - local_pos.x) / ray_dir.x;
@@ -195,7 +223,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         t_max.x = 1.0e10;
     }
 
-    // Y axis
     if (abs(ray_dir.y) > EPSILON) {
         if (ray_dir.y > 0.0) {
             t_max.y = (f32(voxel.y + 1) - local_pos.y) / ray_dir.y;
@@ -206,7 +233,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         t_max.y = 1.0e10;
     }
 
-    // Z axis
     if (abs(ray_dir.z) > EPSILON) {
         if (ray_dir.z > 0.0) {
             t_max.z = (f32(voxel.z + 1) - local_pos.z) / ray_dir.z;
@@ -217,10 +243,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         t_max.z = 1.0e10;
     }
 
-    // Clamp negative tMax (numerical safety near voxel boundaries)
     t_max = max(t_max, vec3<f32>(0.0, 0.0, 0.0));
 
-    // ---- Ray march state ----
     var tau:          f32 = 0.0;
     var transmittance: f32 = 1.0;
     var radiance_in:  vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
@@ -229,11 +253,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var hit_opaque:   bool = false;
     var t_prev:       f32 = 0.0;
 
-    // ---- DDA loop ----
+    // Pre-hit tau: tau before the opaque surface (for emission attenuation
+    // in the fragment shader). Stored in radiance_in.a (the .w component).
+    var pre_hit_tau:  f32 = 0.0;
+
     for (var step_i: u32 = 0u; step_i < params.max_steps; step_i = step_i + 1u) {
         let t_current: f32 = min(min(t_max.x, t_max.y), t_max.z);
 
-        // Exceeded maximum ray length
         if (t_current >= params.ray_length) {
             total_distance = params.ray_length;
             break;
@@ -241,31 +267,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let step_dist: f32 = max(t_current - t_prev, 0.001);
 
-        // ---- Sample block at current voxel ----
         let block_id: u32 = sample_voxel_block(voxel.x, voxel.y, voxel.z);
 
         if (block_id != 0u) {
             let props = read_block_props(block_id);
             let block_opacity:  f32 = props.x;
-            let block_emission: vec3<f32> = vec3<f32>(props.y, props.z, props.w);
+            let block_emission = clamp(
+                vec3<f32>(props.y, props.z, props.w),
+                vec3<f32>(0.0),
+                vec3<f32>(100.0)
+            );
 
             if (block_opacity > 0.001) {
-                // Optical thickness for this voxel traversal
                 let step_tau: f32 = block_opacity * step_dist;
 
-                // Update transmittance
                 let prev_t: f32 = transmittance;
                 let exp_val: f32 = exp(-min(step_tau, 80.0));
                 transmittance = transmittance * exp_val;
 
-                // In-scattered emission weighted by transmittance difference
                 radiance_in = radiance_in + (prev_t - transmittance) * block_emission;
 
-                // Accumulate optical thickness
                 tau = tau + step_tau;
 
-                // Check opaque termination
                 if (tau >= params.opaque_threshold) {
+                    // Surface emission: remove volume contribution from this step,
+                    // store it only as radiance_out (endpoint emission).
+                    radiance_in = radiance_in - (prev_t - transmittance) * block_emission;
+                    pre_hit_tau = tau - step_tau;
                     radiance_out = block_emission;
                     hit_opaque = true;
                     total_distance = t_current;
@@ -274,7 +302,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        // ---- Advance DDA to next voxel ----
         if (t_max.x <= t_max.y && t_max.x <= t_max.z) {
             voxel.x = voxel.x + step_x;
             t_max.x = t_max.x + t_delta.x;
@@ -289,24 +316,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         t_prev = t_current;
     }
 
-    // ---- Finalize ----
-    // If loop ended without break, ray reached max distance
     if (!hit_opaque && total_distance < 0.001) {
         total_distance = params.ray_length;
     }
 
-    // Clamp tau to prevent overflow
     tau = min(tau, params.opaque_threshold);
 
-    // Sky contribution for rays that didn't hit opaque surface
+    // Sky contribution: ONLY sampled in the outermost cascade (C4, cascade_level == 4).
+    // Inner cascades (C0-C3) leave radiance_in at 0 when the ray exits without a hit,
+    // and the merge chain propagates C4's sky radiance inward via transmittance weighting.
+    // This prevents sky from being counted NUM_CASCADES times (which causes white overexposure).
     if (!hit_opaque) {
-        radiance_out = vec3<f32>(params.sky_brightness);
+        pre_hit_tau = tau;
+        if (params.cascade_level == 4u) {
+            let sky_intensity = clamp(params.sky_brightness, 0.0, 1.0);
+            let sky_color = vec3<f32>(
+                sky_intensity * 0.75,
+                sky_intensity * 0.88,
+                sky_intensity * 1.0
+            );
+            radiance_in = radiance_in + transmittance * sky_color;
+        }
+        radiance_out = vec3<f32>(0.0, 0.0, 0.0);
     }
 
-    // ---- Write output interval ----
+    // radiance_in.a (.w) = pre_hit_tau — used by fragment shader for
+    // emission attenuation (only medium BEFORE the opaque surface).
     let output_idx: u32 = probe_flat * rays_per_probe + ray_idx;
     output_intervals[output_idx] = RadianceInterval(
-        vec4<f32>(radiance_in, 0.0),
+        vec4<f32>(radiance_in, pre_hit_tau),
         vec4<f32>(radiance_out, tau),
         vec4<f32>(ray_dir, total_distance)
     );
