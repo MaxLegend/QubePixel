@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "schist",
+  "display_name": "Schist",
+  "description": "Base schist stone. Found throughout the metamorphic micro-region.",
+  "color": [
+    0.34,
+    0.32,
+    0.32
+  ],
+  "material": {
+    "albedo": [
+      0.35,
+      0.31,
+      0.32
+    ],
+    "roughness": 0.88,
+    "metalness": 0.03,
+    "ao": 0.96
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/schist"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/schist"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/schist"
+    }
+  }
+}

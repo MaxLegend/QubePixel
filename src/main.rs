@@ -4,7 +4,9 @@ mod screens;
 use crate::screens::main_menu::MainMenuScreen;
 use std::time::Instant;
 
-use winit::event::{DeviceEvent, Event, WindowEvent};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::Fullscreen;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 
@@ -88,11 +90,14 @@ impl App {
 // Entry point
 // ---------------------------------------------------------------------------
 fn main() {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    if let Err(e) = core::logging::init_logger() {
+        eprintln!("Ошибка инициализации логгера: {}", e);
+    }
 
-    debug_log!("Main", "init", "Starting QubePixel v0.0.1");
+    debug_log!("Main", "init", "Starting Techpixel v0.0.1");
+
+    // Load and apply persisted user settings (render distance, shadows, etc.)
+    core::user_settings::load_and_apply();
 
     let event_loop = EventLoop::new()
         .expect("Failed to create winit event loop");
@@ -102,12 +107,39 @@ fn main() {
     let window = event_loop
         .create_window(
             winit::window::WindowAttributes::default()
-                .with_title("QubePixel")
+                .with_title("Techpixel")
                 .with_inner_size(winit::dpi::LogicalSize::new(840, 480)),
         )
         .expect("Failed to create winit window");
 
     debug_log!("Main", "init", "Window created");
+
+    // --- Load application icon (assets/icon.png, 32×32 or 64×64 PNG) ---
+    const ICON_PATH: &str = "assets/icon.png";
+    if std::path::Path::new(ICON_PATH).exists() {
+        match image::open(ICON_PATH) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                // winit 0.30: set_window_icon takes Option<Icon> built from rgba bytes
+                let icon = winit::window::Icon::from_rgba(rgba.into_raw(), w, h);
+                match icon {
+                    Ok(ic) => {
+                        window.set_window_icon(Some(ic));
+                        debug_log!("Main", "init", "App icon loaded from {}", ICON_PATH);
+                    }
+                    Err(e) => {
+                        debug_log!("Main", "init", "Failed to create Icon: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                debug_log!("Main", "init", "Failed to load icon {}: {}", ICON_PATH, e);
+            }
+        }
+    } else {
+        debug_log!("Main", "init", "No icon at {}, skipping", ICON_PATH);
+    }
 
     let tokio_runtime = tokio::runtime::Runtime::new()
         .expect("Failed to create tokio runtime");
@@ -180,85 +212,111 @@ fn main() {
                             let dt  = now.duration_since(last_time).as_secs_f64();
                             last_time = now;
 
+                            // ── Phase 1: CPU work ─────────────────────────────────
+                            // Runs while the GPU is executing the PREVIOUS frame.
+                            // The GPU has already been given all commands; doing CPU
+                            // work here lets us overlap and reduces get_tex() wait time.
+
+                            let t_update = Instant::now();
                             app.screen_manager.update(dt);
                             app.screen_manager.post_process(dt);
+                            crate::core::frame_timing::set_update(t_update.elapsed().as_micros());
 
-                            // Apply cursor lock based on active screen's request
                             app.apply_cursor_lock();
 
-                            // Window title
                             if let Some(window) = app.window.as_ref() {
                                 if let Some(screen) = app.screen_manager.active_screen() {
-                                    window.set_title(
-                                        &format!("QubePixel — {}", screen.name())
-                                    );
+                                    window.set_title(&format!("Techpixel — {}", screen.name()));
                                 }
                             }
 
-                            // --- egui frame: build UI + tessellate ----------------
+                            // Build egui UI + tessellate on CPU.
+                            let t_egui = Instant::now();
                             let clipped_primitives = {
-                                // Обновляем размер экрана для egui
                                 let size = app.renderer.size();
                                 let scale = app.window.as_ref()
                                     .map(|w| w.scale_factor() as f32)
                                     .unwrap_or(1.0);
-                                app.egui_manager.update_screen_size(
-                                    size.width, size.height, scale,
-                                );
+                                app.egui_manager.update_screen_size(size.width, size.height, scale);
                                 if let Some(window) = app.window.as_ref() {
                                     app.egui_manager.update_viewport_info(window);
                                 }
-                                // Берём RawInput из winit state
                                 let raw_input = app.egui_manager
-
                                     .take_egui_input(app.window.as_ref().unwrap());
-
-                                // Строим UI через ScreenManager
                                 let egui_ctx = app.egui_manager.ctx().clone();
                                 let full_output = egui_ctx.run(raw_input, |ctx| {
                                     app.screen_manager.build_ui(ctx);
                                 });
-                                // if let Some(window) = app.window.as_ref() {
-                                //     app.egui_manager.handle_platform_output(
-                                //         window,
-                                //         full_output.platform_output,
-                                //     );
-                                // }
-                                // Текстуры + тесселяция
                                 app.egui_manager.end_frame_and_tessellate(
                                     app.renderer.device(),
                                     app.renderer.queue(),
                                     full_output,
                                 )
                             };
+                            crate::core::frame_timing::set_egui_build(t_egui.elapsed().as_micros());
 
-                            // --- Рендер (3D + egui) --------------------------------
-                            {
+                            // ── Phase 2: GPU sync ─────────────────────────────────
+                            // Acquire next swapchain image. May block waiting for GPU
+                            // to finish the previous frame and release a buffer slot.
+                            // CPU has already done useful work above, so GPU has had
+                            // more time to finish → expected shorter block than before.
+                            if let Some(frame) = app.renderer.acquire_frame() {
+
+                                // ── Phase 3: Encode ───────────────────────────────
                                 let clear_color = app.screen_manager.clear_color();
                                 let size        = app.renderer.size();
-                                let sm          = &mut app.screen_manager;
-                                let egui_mgr    = &mut app.egui_manager;
-                                let renderer    = &mut app.renderer;
+                                let mut encoder = app.renderer.begin_encoder();
+                                app.renderer.clear_pass(&mut encoder, &frame.view, clear_color);
 
-                                renderer.render(
-                                    clear_color,
-                                    |encoder, view, device, queue, format| {
-                                        // 3D сцена
-                                        sm.render(
-                                            encoder, view, device, queue,
-                                            format, size.width, size.height,
-                                        );
-                                        // egui HUD поверх 3D
-                                        egui_mgr.render_draw(
-                                            encoder, view, device, queue,
-                                            &clipped_primitives,
-                                        );
-                                    },
+                                // 3D scene
+                                app.screen_manager.render(
+                                    &mut encoder, &frame.view,
+                                    app.renderer.device(), app.renderer.queue(),
+                                    app.renderer.surface_format(),
+                                    size.width, size.height,
                                 );
+
+                                // egui HUD on top
+                                let t_egui_render = Instant::now();
+                                app.egui_manager.render_draw(
+                                    &mut encoder, &frame.view,
+                                    app.renderer.device(), app.renderer.queue(),
+                                    &clipped_primitives,
+                                );
+                                crate::core::frame_timing::set_egui_render(
+                                    t_egui_render.elapsed().as_micros()
+                                );
+
+                                // ── Phase 4: Submit ───────────────────────────────
+                                // GPU starts executing immediately; CPU returns fast.
+                                // Next iteration begins with Phase 1 CPU work while GPU renders.
+                                app.renderer.submit_frame(encoder, frame);
                             }
 
                             if let Some(window) = app.window.as_ref() {
                                 window.request_redraw();
+                            }
+                        }
+
+                        // F11 — toggle borderless fullscreen
+                        WindowEvent::KeyboardInput {
+                            event: KeyEvent {
+                                physical_key: PhysicalKey::Code(KeyCode::F11),
+                                state: ElementState::Pressed,
+                                repeat: false,
+                                ..
+                            },
+                            ..
+                        } => {
+                            if let Some(window) = app.window.as_ref() {
+                                let next = if window.fullscreen().is_some() {
+                                    None
+                                } else {
+                                    Some(Fullscreen::Borderless(None))
+                                };
+                                window.set_fullscreen(next);
+                                debug_log!("Main", "window_event",
+                                    "F11: fullscreen={}", window.fullscreen().is_some());
                             }
                         }
 

@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "dirt_andesite",
+  "display_name": "Andesite Dirt",
+  "description": "Standard dirt layer beneath andesite grass.",
+  "color": [
+    0.48,
+    0.39,
+    0.28
+  ],
+  "material": {
+    "albedo": [
+      0.46,
+      0.39,
+      0.26
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_andesite"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_andesite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_andesite"
+    }
+  }
+}

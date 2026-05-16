@@ -1,0 +1,110 @@
+{
+  "biome_tint": false,
+  "color": [
+    1.0,
+    0.8500000238418579,
+    0.4000000059604645
+  ],
+  "default_rotation": 0,
+  "description": "A warm-glowing block that illuminates the darkness",
+  "display_name": "Glowstone",
+  "emission": {
+    "emit_light": true,
+    "light_color": [
+      1.0,
+      0.8500000238418579,
+      0.30000001192092896
+    ],
+    "light_intensity": 0.5,
+    "light_range": 128.0,
+    "light_strength": 0.5,
+    "no_self_gi": true
+  },
+  "emit_light": 25,
+  "faces": {
+    "all": null,
+    "bottom": {
+      "color": [
+        1.0,
+        0.8500000238418579,
+        0.4000000059604645
+      ],
+      "layer1": null,
+      "layer2": null,
+      "layer3": null,
+      "layer4": null,
+      "layer5": null,
+      "texture": "glowstone"
+    },
+    "east": null,
+    "north": null,
+    "sides": {
+      "color": [
+        1.0,
+        0.8500000238418579,
+        0.4000000059604645
+      ],
+      "layer1": null,
+      "layer2": null,
+      "layer3": null,
+      "layer4": null,
+      "layer5": null,
+      "texture": "glowstone"
+    },
+    "south": null,
+    "top": {
+      "color": [
+        1.0,
+        0.8500000238418579,
+        0.4000000059604645
+      ],
+      "layer1": null,
+      "layer2": null,
+      "layer3": null,
+      "layer4": null,
+      "layer5": null,
+      "texture": "glowstone"
+    },
+    "west": null
+  },
+  "fluid": null,
+  "format_version": 2,
+  "glass": {
+    "opacity": 0.15000000596046448,
+    "tint_color": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "id": "glowstone",
+  "inventory_tab": "Lighting2",
+  "is_water": false,
+  "material": {
+    "albedo": [
+      1.0,
+      0.8500000238418579,
+      0.4000000059604645
+    ],
+    "ao": 1.0,
+    "metalness": 0.0,
+    "roughness": 0.699999988079071
+  },
+  "model": null,
+  "model_textures": {},
+  "placement_mode": "fixed",
+  "solid": true,
+  "texture": null,
+  "transparent": false,
+  "volumetric": {
+    "halo_enabled": true,
+    "halo_intensity": 0.6499999761581421,
+    "halo_radius": 2.799999952316284,
+    "ray_count": 5,
+    "ray_enabled": true,
+    "ray_falloff": 2.200000047683716,
+    "ray_intensity": 0.2199999988079071,
+    "ray_length": 7.0,
+    "ray_width": 0.3799999952316284
+  }
+}

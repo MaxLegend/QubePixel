@@ -2,7 +2,9 @@
 // Minecraft Clone — Global debug flag and logging macro
 // =============================================================================
 
+use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, Ordering};
+
 
 /// Global toggle for debug logging.
 /// When `false`, all `debug_log!` calls are no-ops (zero cost).
@@ -10,6 +12,43 @@ pub(crate) static IS_DEBUG: AtomicBool = AtomicBool::new(true);
 pub(crate) static IS_EXTENDED_DEBUG: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static IS_FLOW_DEBUG: AtomicBool = AtomicBool::new(false);
+
+
+pub fn init_logger() -> Result<(), fern::InitError> {
+    let base_config = fern::Dispatch::new()
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "{}[{}][{}] {}",
+                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
+                record.target(),
+                record.level(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Info);
+
+    // Конфигурация для вывода в консоль
+    let stdout_config = fern::Dispatch::new()
+        .chain(std::io::stdout());
+
+    // Конфигурация для вывода в файл (создает или дополняет output.log)
+    let file_config = fern::Dispatch::new()
+        .chain(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true) // Чтобы не стирать старые логи при перезапуске
+                .open("output.log")?
+        );
+
+    // Объединяем всё вместе
+    base_config
+        .chain(stdout_config)
+        .chain(file_config)
+        .apply()?;
+
+    Ok(())
+}
 /// Returns the current value of `IS_DEBUG`.
 #[allow(dead_code)]
 pub(crate) fn is_debug() -> bool {

@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "dirt_basalt",
+  "display_name": "Basalt Dirt",
+  "description": "Standard dirt layer beneath basalt grass.",
+  "color": [
+    0.31,
+    0.25,
+    0.17
+  ],
+  "material": {
+    "albedo": [
+      0.32,
+      0.23,
+      0.18
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_basalt"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_basalt"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_basalt"
+    }
+  }
+}

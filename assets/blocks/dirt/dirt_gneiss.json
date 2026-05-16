@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "dirt_gneiss",
+  "display_name": "Gneiss Dirt",
+  "description": "Standard dirt layer beneath gneiss grass.",
+  "color": [
+    0.47,
+    0.35,
+    0.25
+  ],
+  "material": {
+    "albedo": [
+      0.46,
+      0.35,
+      0.26
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_gneiss"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_gneiss"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_gneiss"
+    }
+  }
+}

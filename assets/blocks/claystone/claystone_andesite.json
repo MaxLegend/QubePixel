@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "claystone_andesite",
+  "display_name": "Hard Andesite Clay",
+  "description": "Hardened clay layer compressed from andesite sediment.",
+  "color": [
+    0.56,
+    0.53,
+    0.5
+  ],
+  "material": {
+    "albedo": [
+      0.58,
+      0.54,
+      0.49
+    ],
+    "roughness": 0.8,
+    "metalness": 0.05,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "claystone/claystone_andesite"
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "format_version": 2,
+  "id": "grass_lherzolite",
+  "display_name": "Lherzolite Grass",
+  "description": "Grass-covered surface layer with lherzolite soil underneath.",
+  "color": [
+    0.28,
+    0.52,
+    0.19
+  ],
+  "material": {
+    "albedo": [
+      0.29,
+      0.5,
+      0.22
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_lherzolite",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_lherzolite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_lherzolite",
+      "layer1": "common/grass_side"
+    }
+  }
+}

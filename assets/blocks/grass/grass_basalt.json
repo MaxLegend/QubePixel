@@ -1,0 +1,62 @@
+{
+  "format_version": 2,
+  "id": "grass_basalt",
+  "display_name": "Basalt Grass",
+  "description": "Grass-covered surface layer with basalt soil underneath.",
+  "color": [
+    0.21,
+    0.43,
+    0.19
+  ],
+  "material": {
+    "albedo": [
+      0.24,
+      0.42,
+      0.19
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_basalt",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_basalt"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_basalt",
+      "layer1": "common/grass_side"
+    }
+  }
+}

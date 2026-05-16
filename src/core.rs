@@ -1,16 +1,28 @@
 // src/core.rs
-pub mod screen;     
+pub mod screen;
 pub mod screen_manager;
 pub mod logging;
 pub(crate) mod input_controller;
 pub(crate) mod renderer;
 pub mod gameobjects;
+pub mod world_gen;
 pub mod config;
 pub(crate) mod raycast;
 pub(crate) mod physics;
 pub(crate) mod player;
 pub(crate) mod egui_fonts;
 pub(crate) mod egui_manager;
+pub(crate) mod egui_style;
 pub(crate) mod upload_worker;
 pub mod lighting;
-
+pub(crate) mod lighting_legacy;
+pub mod vct;
+pub mod water;
+pub mod fluid;
+pub mod player_model;
+pub mod block_model;
+pub mod model_messenger;
+pub mod entity;
+pub mod frame_timing;
+pub mod user_settings;
+pub mod save_system;

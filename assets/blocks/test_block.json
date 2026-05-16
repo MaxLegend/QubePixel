@@ -1,0 +1,96 @@
+{
+  "biome_tint": false,
+  "color": [
+    0.07000000029802322,
+    0.5,
+    0.5
+  ],
+  "default_rotation": 0,
+  "description": "",
+  "display_name": "TEST BLOCK IN BE",
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_intensity": 2.0999999046325684,
+    "light_range": 46.0,
+    "light_strength": 6.300000190734863,
+    "no_self_gi": false
+  },
+  "faces": {
+    "all": null,
+    "bottom": null,
+    "east": null,
+    "north": null,
+    "sides": null,
+    "south": null,
+    "top": null,
+    "west": null
+  },
+  "fluid": null,
+  "format_version": 2,
+  "glass": {
+    "opacity": 0.6399999856948853,
+    "tint_color": [
+      0.6200000047683716,
+      0.3199999928474426,
+      0.47999998927116394
+    ]
+  },
+  "id": "test_block",
+  "inventory_tab": null,
+  "light_sources": [
+    {
+      "color": [
+        0.23000000417232513,
+        0.17000000178813934,
+        1.0
+      ],
+      "direction": [
+        0.0,
+        -1.0,
+        0.0
+      ],
+      "focus": 30.0,
+      "intensity": 5.599999904632568,
+      "kind": "point",
+      "label": "",
+      "position": [
+        -0.5,
+        0.5,
+        0.0
+      ],
+      "range": 20.0
+    }
+  ],
+  "material": {
+    "albedo": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "ao": 1.0,
+    "metalness": 0.8500000238418579,
+    "roughness": 0.8999999761581421
+  },
+  "model": null,
+  "model_textures": {},
+  "placement_mode": "fixed",
+  "solid": true,
+  "texture": null,
+  "transparent": false,
+  "volumetric": {
+    "halo_enabled": false,
+    "halo_intensity": 0.5799999833106995,
+    "halo_radius": 5.599999904632568,
+    "ray_count": 4,
+    "ray_enabled": false,
+    "ray_falloff": 2.0,
+    "ray_intensity": 0.18000000715255737,
+    "ray_length": 6.0,
+    "ray_width": 0.4000000059604645
+  }
+}

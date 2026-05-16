@@ -1,0 +1,62 @@
+{
+  "format_version": 2,
+  "id": "grass_ophiolite",
+  "display_name": "Ophiolite Grass",
+  "description": "Grass-covered surface layer with ophiolite soil underneath.",
+  "color": [
+    0.17,
+    0.38,
+    0.21
+  ],
+  "material": {
+    "albedo": [
+      0.18,
+      0.39,
+      0.22
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_ophiolite",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_ophiolite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_ophiolite",
+      "layer1": "common/grass_side"
+    }
+  }
+}

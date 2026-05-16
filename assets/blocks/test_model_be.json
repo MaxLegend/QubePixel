@@ -1,0 +1,28 @@
+{
+    "id": "test_model_be",
+    "display_name": "test_model_be",
+    "description": "A crafting station with custom Bedrock geometry model",
+    "color": [
+        0.725,
+        0.514,
+        0.125
+    ],
+    "solid": true,
+    "transparent": false,
+    "inventory_tab": "Decoration",
+    "placement_mode": "attach_full",
+    "default_rotation": 0,
+    "model": "test_model_be.json",
+    "model_textures": {
+        "default": "test_model_be.png"
+    },
+    "material": {
+        "color": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "roughness": 0.85,
+        "metalness": 0.0
+    }
+}

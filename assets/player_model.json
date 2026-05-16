@@ -1,0 +1,146 @@
+{
+    "format_version": "1.12.0",
+    "minecraft:geometry": [
+        {
+            "description": {
+                "identifier": "geometry.npc.steve",
+                "visible_bounds_width": 1,
+                "visible_bounds_height": 2,
+                "visible_bounds_offset": [0, 1, 0],
+                "texture_width": 64,
+                "texture_height": 64
+            },
+            "bones": [
+                {
+                    "name": "root",
+                    "pivot": [0.0, 0.0, 0.0]
+                },
+                {
+                    "name": "waist",
+                    "parent": "root",
+                    "pivot": [0.0, 12.0, 0.0]
+                },
+                {
+                    "name": "body",
+                    "parent": "waist",
+                    "pivot": [0.0, 24.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-4.0, 12.0, -2.0],
+                            "size": [8, 12, 4],
+                            "uv": [16, 16]
+                        }
+                    ]
+                },
+                {
+                    "name": "head",
+                    "parent": "body",
+                    "pivot": [0.0, 24.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-4.0, 24.0, -4.0],
+                            "size": [8, 8, 8],
+                            "uv": [0, 0]
+                        }
+                    ]
+                },
+                {
+                    "name": "leftArm",
+                    "parent": "body",
+                    "pivot": [5.0, 22.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [4.0, 18.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [32, 48]
+                        }
+                    ]
+                },
+                {
+                    "name": "leftForearm",
+                    "parent": "leftArm",
+                    "pivot": [5.0, 18.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [4.0, 12.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [32, 54]
+                        }
+                    ]
+                },
+                {
+                    "name": "rightArm",
+                    "parent": "body",
+                    "pivot": [-5.0, 22.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-8.0, 18.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [40, 16]
+                        }
+                    ]
+                },
+                {
+                    "name": "rightForearm",
+                    "parent": "rightArm",
+                    "pivot": [-5.0, 18.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-8.0, 12.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [40, 22]
+                        }
+                    ]
+                },
+                {
+                    "name": "leftThigh",
+                    "parent": "root",
+                    "pivot": [1.9, 12.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-0.1, 6.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [16, 48]
+                        }
+                    ]
+                },
+                {
+                    "name": "leftShin",
+                    "parent": "leftThigh",
+                    "pivot": [1.9, 6.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-0.1, 0.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [16, 54]
+                        }
+                    ]
+                },
+                {
+                    "name": "rightThigh",
+                    "parent": "root",
+                    "pivot": [-1.9, 12.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-3.9, 6.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [0, 16]
+                        }
+                    ]
+                },
+                {
+                    "name": "rightShin",
+                    "parent": "rightThigh",
+                    "pivot": [-1.9, 6.0, 0.0],
+                    "cubes": [
+                        {
+                            "origin": [-3.9, 0.0, -2.0],
+                            "size": [4, 6, 4],
+                            "uv": [0, 22]
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

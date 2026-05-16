@@ -1,0 +1,36 @@
+{
+  "format_version": 2,
+  "id": "glass_red",
+  "display_name": "Red Stained Glass",
+  "description": "Red stained glass. Tints sunlight and GI passing through with a red hue.",
+
+  "color": [1.0, 0.35, 0.35],
+
+  "material": {
+    "albedo":    [1.0, 0.35, 0.35],
+    "roughness": 0.05,
+    "metalness": 0.0,
+    "ao":        1.0
+  },
+
+  "solid": true,
+  "transparent": true,
+  "inventory_tab": "Decoration",
+
+  "glass": {
+    "tint_color": [1.0, 0.30, 0.30],
+    "opacity":    0.55
+  },
+
+  "emit_light": 0,
+  "emission": {
+    "emit_light":      false,
+    "light_color":     [1.0, 1.0, 1.0],
+    "light_strength":  0.0,
+    "light_intensity": 0.0
+  },
+
+  "faces": {
+    "all": { "color": [1.0, 0.50, 0.50], "texture": "common/ice" }
+  }
+}

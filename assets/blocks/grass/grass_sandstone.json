@@ -1,0 +1,62 @@
+{
+  "format_version": 2,
+  "id": "grass_sandstone",
+  "display_name": "Sandstone Grass",
+  "description": "Grass-covered surface layer with sandstone soil underneath.",
+  "color": [
+    0.54,
+    0.71,
+    0.28
+  ],
+  "material": {
+    "albedo": [
+      0.55,
+      0.72,
+      0.32
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_sandstone",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_sandstone"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_sandstone",
+      "layer1": "common/grass_side"
+    }
+  }
+}

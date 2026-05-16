@@ -1,0 +1,63 @@
+{
+  "format_version": 2,
+  "id": "grass_kimberlite",
+  "display_name": "Kimberlite Grass",
+  "description": "Grass-covered surface layer with kimberlite soil underneath.",
+  "color": [
+    0.24,
+    0.46,
+    0.22
+  ],
+  "material": {
+    "albedo": [
+      0.27,
+      0.45,
+      0.23
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_kimberlite",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_kimberlite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_kimberlite",
+      "layer1": "common/grass_side"
+    }
+  }
+  
+  }

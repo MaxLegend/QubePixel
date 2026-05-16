@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "claystone_kimberlite",
+  "display_name": "Hard Kimberlite Clay",
+  "description": "Hardened clay layer compressed from kimberlite sediment.",
+  "color": [
+    0.35,
+    0.29,
+    0.36
+  ],
+  "material": {
+    "albedo": [
+      0.34,
+      0.31,
+      0.36
+    ],
+    "roughness": 0.8,
+    "metalness": 0.05,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "claystone/claystone_kimberlite"
+    }
+  }
+}

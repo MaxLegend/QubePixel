@@ -1,0 +1,49 @@
+{
+  "test_mode": false,
+  "geography": {
+    "sea_level": 51,
+    "terrain_base": 53,
+    "terrain_amplitude": 40,
+    "continent_scale": 1120.0,
+    "erosion_scale": 745.0,
+    "peaks_scale": 2700.0,
+    "island_scale": 98.0,
+    "continent_octaves": 4,
+    "erosion_octaves": 4,
+    "peaks_octaves": 4,
+    "island_threshold": 0.4,
+    "island_boost": 0.3,
+    "deep_ocean_max": 0.2,
+    "ocean_max": 0.4,
+    "lowland_max": 0.6,
+    "midland_max": 0.8,
+    "river_scale": 333.0,
+    "river_threshold": 0.067,
+    "river_carve_depth": 29.0
+  },
+  "climate": {
+    "band_scale": 16000.0,
+    "boundary_noise_scale": 0.00005,
+    "boundary_warp_amount": 1500.0,
+    "humidity_noise_scale": 500.0
+  },
+  "geology": {
+    "macro_cell_size": 1850,
+    "micro_cell_size": 512,
+    "mantle_keep_denominator": 5
+  },
+  "stratification": {
+    "deep_granite_threshold": 32,
+    "deep_granite_transition": 16,
+    "thickness_noise_scale": 0.02,
+    "dirt_thickness_base": 4,
+    "dirt_thickness_variation": 1,
+    "clay_thickness_base": 4,
+    "clay_thickness_variation": 2,
+    "claystone_thickness_base": 10,
+    "claystone_thickness_variation": 10
+  },
+  "nature": {
+    "tree_density_multiplier": 1.0
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "granite",
+  "display_name": "Granite",
+  "description": "Base granite stone. Found throughout the igneous micro-region.",
+  "color": [
+    0.61,
+    0.57,
+    0.5
+  ],
+  "material": {
+    "albedo": [
+      0.61,
+      0.53,
+      0.51
+    ],
+    "roughness": 0.86,
+    "metalness": 0.0,
+    "ao": 0.93
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/granite"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/granite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/granite"
+    }
+  }
+}

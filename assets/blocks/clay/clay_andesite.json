@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "clay_andesite",
+  "display_name": "Soft Andesite Clay",
+  "description": "Soft clay layer derived from weathered andesite stone.",
+  "color": [
+    0.55,
+    0.48,
+    0.42
+  ],
+  "material": {
+    "albedo": [
+      0.56,
+      0.5,
+      0.41
+    ],
+    "roughness": 0.9,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "clay/clay_andesite"
+    }
+  }
+}

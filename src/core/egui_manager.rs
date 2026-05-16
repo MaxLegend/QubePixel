@@ -22,6 +22,9 @@ impl EguiManager {
 
         let ctx = egui::Context::default();
 
+        // Apply the unified Techpixel pixel-art theme
+        crate::core::egui_style::apply_pixel_theme(&ctx);
+
         // --- egui_winit state (6 arguments) ---------------------------------
         // Order: egui_ctx, viewport_id, display_target,
         //        native_pixels_per_point, theme, max_texture_side

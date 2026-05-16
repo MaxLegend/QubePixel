@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "limestone",
+  "display_name": "Limestone",
+  "description": "Base limestone stone. Found throughout the sedimentary micro-region.",
+  "color": [
+    0.78,
+    0.79,
+    0.74
+  ],
+  "material": {
+    "albedo": [
+      0.8,
+      0.78,
+      0.71
+    ],
+    "roughness": 0.94,
+    "metalness": 0.02,
+    "ao": 0.93
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/limestone"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/limestone"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/limestone"
+    }
+  }
+}

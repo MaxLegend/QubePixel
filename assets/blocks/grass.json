@@ -15,7 +15,9 @@
 
   "solid": true,
   "transparent": false,
+  "biome_tint": true,
   "emit_light": 0,
+  "inventory_tab": "Natural",
 
   "emission": {
     "emit_light":      false,

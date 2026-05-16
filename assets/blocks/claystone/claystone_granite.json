@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "claystone_granite",
+  "display_name": "Hard Granite Clay",
+  "description": "Hardened clay layer compressed from granite sediment.",
+  "color": [
+    0.53,
+    0.48,
+    0.43
+  ],
+  "material": {
+    "albedo": [
+      0.5,
+      0.47,
+      0.43
+    ],
+    "roughness": 0.8,
+    "metalness": 0.05,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "claystone/claystone_granite"
+    }
+  }
+}

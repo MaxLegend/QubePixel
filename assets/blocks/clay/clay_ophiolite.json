@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "clay_ophiolite",
+  "display_name": "Soft Ophiolite Clay",
+  "description": "Soft clay layer derived from weathered ophiolite stone.",
+  "color": [
+    0.32,
+    0.39,
+    0.31
+  ],
+  "material": {
+    "albedo": [
+      0.3,
+      0.39,
+      0.33
+    ],
+    "roughness": 0.9,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+ "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "clay/clay_ophiolite"
+    }
+  }
+}

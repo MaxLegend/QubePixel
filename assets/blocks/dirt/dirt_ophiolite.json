@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "dirt_ophiolite",
+  "display_name": "Ophiolite Dirt",
+  "description": "Standard dirt layer beneath ophiolite grass.",
+  "color": [
+    0.28,
+    0.34,
+    0.25
+  ],
+  "material": {
+    "albedo": [
+      0.29,
+      0.35,
+      0.24
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_ophiolite"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_ophiolite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_ophiolite"
+    }
+  }
+}

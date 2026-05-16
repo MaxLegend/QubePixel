@@ -143,3 +143,81 @@ pub fn dda_raycast(
     flow_debug_log!("Raycast", "dda_raycast", "No block hit within distance");
     None
 }
+
+// ---------------------------------------------------------------------------
+// Ray–AABB intersection
+// ---------------------------------------------------------------------------
+
+/// Test whether a ray intersects an axis-aligned bounding box.
+///
+/// Returns `Some(t)` where *t* is the parametric distance along the ray to
+/// the **entry** point of the box, or `None` if the ray misses.
+///
+/// The AABB is defined by its `min` and `max` corners (world-space).
+/// The ray is `origin + t * direction` with `t >= 0`.
+pub fn ray_aabb_intersection(
+    ray_origin: Vec3,
+    ray_dir:    Vec3,
+    aabb_min:   Vec3,
+    aabb_max:   Vec3,
+) -> Option<f32> {
+    // Slab method: for each axis compute entry/exit t values.
+    let mut t_enter = 0.0f32;
+    let mut t_exit  = f32::MAX;
+
+    for i in 0..3 {
+        let o = ray_origin[i];
+        let d = ray_dir[i];
+        let mn = aabb_min[i];
+        let mx = aabb_max[i];
+
+        if d.abs() < 1e-10 {
+            // Ray parallel to slab — origin must be inside
+            if o < mn || o > mx {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / d;
+            let t1 = (mn - o) * inv_d;
+            let t2 = (mx - o) * inv_d;
+            let (t_near, t_far) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+
+            t_enter = t_enter.max(t_near);
+            t_exit  = t_exit.min(t_far);
+
+            if t_enter > t_exit {
+                return None;
+            }
+        }
+    }
+
+    if t_exit < 0.0 {
+        return None;
+    }
+
+    Some(t_enter.max(0.0))
+}
+
+// ---------------------------------------------------------------------------
+// Möller–Trumbore ray–triangle intersection
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the ray `origin + t * dir` (t > 0) intersects the
+/// triangle (`v0`, `v1`, `v2`).  Backface hits are accepted (two-sided).
+pub fn ray_triangle_intersect(origin: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> bool {
+    const EPSILON: f32 = 1e-7;
+    let edge1 = v1 - v0;
+    let edge2 = v2 - v0;
+    let h = dir.cross(edge2);
+    let a = edge1.dot(h);
+    if a.abs() < EPSILON { return false; } // ray parallel to triangle
+    let f = 1.0 / a;
+    let s = origin - v0;
+    let u = f * s.dot(h);
+    if u < 0.0 || u > 1.0 { return false; }
+    let q = s.cross(edge1);
+    let v = f * dir.dot(q);
+    if v < 0.0 || u + v > 1.0 { return false; }
+    let t = f * edge2.dot(q);
+    t > EPSILON
+}

@@ -1,0 +1,62 @@
+{
+  "format_version": 2,
+  "id": "grass_andesite",
+  "display_name": "Andesite Grass",
+  "description": "Grass-covered surface layer with andesite soil underneath.",
+  "color": [
+    0.36,
+    0.55,
+    0.26
+  ],
+  "material": {
+    "albedo": [
+      0.36,
+      0.57,
+      0.23
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_andesite",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_andesite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_andesite",
+      "layer1": "common/grass_side"
+    }
+  }
+}

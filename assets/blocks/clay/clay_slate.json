@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "clay_shale",
+  "display_name": "Soft Shale Clay",
+  "description": "Soft clay layer derived from weathered shale stone.",
+  "color": [
+    0.41,
+    0.36,
+    0.3
+  ],
+  "material": {
+    "albedo": [
+      0.43,
+      0.36,
+      0.32
+    ],
+    "roughness": 0.9,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "clay/clay_slate"
+    }
+  }
+}

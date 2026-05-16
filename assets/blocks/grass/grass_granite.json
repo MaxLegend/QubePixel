@@ -1,0 +1,62 @@
+{
+  "format_version": 2,
+  "id": "grass_granite",
+  "display_name": "Granite Grass",
+  "description": "Grass-covered surface layer with granite soil underneath.",
+  "color": [
+    0.38,
+    0.57,
+    0.25
+  ],
+  "material": {
+    "albedo": [
+      0.37,
+      0.59,
+      0.26
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+   "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_granite",
+      "layer1": "common/grass"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_granite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_granite",
+      "layer1": "common/grass_side"
+    }
+  }
+}

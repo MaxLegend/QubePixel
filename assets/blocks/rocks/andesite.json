@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "andesite",
+  "display_name": "Andesite",
+  "description": "Base andesite stone. Found throughout the igneous micro-region.",
+  "color": [
+    0.63,
+    0.63,
+    0.61
+  ],
+  "material": {
+    "albedo": [
+      0.64,
+      0.62,
+      0.6
+    ],
+    "roughness": 0.88,
+    "metalness": 0.01,
+    "ao": 0.92
+  },
+  "solid": true,
+  "transparent": true,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/andesite_transparent"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/andesite_transparent"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/andesite_transparent"
+    }
+  }
+}

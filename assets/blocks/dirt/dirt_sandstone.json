@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "dirt_sandstone",
+  "display_name": "Sandstone Dirt",
+  "description": "Standard dirt layer beneath sandstone grass.",
+  "color": [
+    0.76,
+    0.6,
+    0.42
+  ],
+  "material": {
+    "albedo": [
+      0.76,
+      0.58,
+      0.41
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_sandstone"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_sandstone"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_sandstone"
+    }
+  }
+}

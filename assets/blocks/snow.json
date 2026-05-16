@@ -1,0 +1,45 @@
+{
+  "format_version": 2,
+  "id": "snow",
+  "display_name": "Snow",
+  "description": "Snow layer block found in cold biomes.",
+  "color": [
+    0.95,
+    0.97,
+    1.0
+  ],
+  "material": {
+    "albedo": [
+      0.93,
+      0.96,
+      1.0
+    ],
+    "roughness": 0.85,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "inventory_tab": "Natural",
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "common/snow"
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "kimberlite",
+  "display_name": "Kimberlite",
+  "description": "Base kimberlite stone. Found throughout the mantle micro-region.",
+  "color": [
+    0.28,
+    0.29,
+    0.35
+  ],
+  "material": {
+    "albedo": [
+      0.31,
+      0.28,
+      0.34
+    ],
+    "roughness": 0.95,
+    "metalness": 0.09,
+    "ao": 0.95
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/kimberlite"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/kimberlite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/kimberlite"
+    }
+  }
+}

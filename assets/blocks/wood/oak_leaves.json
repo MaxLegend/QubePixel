@@ -1,0 +1,28 @@
+{
+  "format_version": 2,
+  "id": "wood/oak_leaves",
+  "display_name": "Oak Leaves",
+  "description": "Dense oak foliage. Tinted by the local biome colour.",
+  "color": [0.22, 0.52, 0.14],
+  "material": {
+    "albedo": [0.22, 0.52, 0.14],
+    "roughness": 0.85,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "biome_tint": true,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [1.0, 1.0, 1.0],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "placement_mode": "fixed",
+  "default_rotation": 0,
+  "faces": {
+    "all": { "color": [1.0, 1.0, 1.0], "texture": "wood/oak_leaves" }
+  }
+}

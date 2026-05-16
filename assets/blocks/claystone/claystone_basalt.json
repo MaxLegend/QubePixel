@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "claystone_basalt",
+  "display_name": "Hard Basalt Clay",
+  "description": "Hardened clay layer compressed from basalt sediment.",
+  "color": [
+    0.27,
+    0.23,
+    0.21
+  ],
+  "material": {
+    "albedo": [
+      0.27,
+      0.26,
+      0.22
+    ],
+    "roughness": 0.8,
+    "metalness": 0.05,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "claystone/claystone_basalt"
+    }
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "claystone_limestone",
+  "display_name": "Hard Limestone Clay",
+  "description": "Hardened clay layer compressed from limestone sediment.",
+  "color": [
+    0.71,
+    0.67,
+    0.6
+  ],
+  "material": {
+    "albedo": [
+      0.71,
+      0.67,
+      0.61
+    ],
+    "roughness": 0.8,
+    "metalness": 0.05,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "claystone/claystone_limestone"
+    }
+  }
+}

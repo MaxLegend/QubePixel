@@ -1,0 +1,110 @@
+{
+  "biome_tint": false,
+  "color": [
+    0.38999998569488525,
+    0.3700000047683716,
+    0.36000001430511475
+  ],
+  "default_rotation": 0,
+  "description": "Dense granite found deep underground with higher metal content.",
+  "display_name": "Deep Granite",
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_intensity": 0.0,
+    "light_range": 24.0,
+    "light_strength": 0.0,
+    "no_self_gi": false
+  },
+  "emit_light": 0,
+  "faces": {
+    "all": null,
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "layer1": null,
+      "layer2": null,
+      "layer3": null,
+      "layer4": null,
+      "layer5": null,
+      "texture": "rocks/deep_granite"
+    },
+    "east": null,
+    "north": null,
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "layer1": null,
+      "layer2": null,
+      "layer3": null,
+      "layer4": null,
+      "layer5": null,
+      "texture": "rocks/deep_granite"
+    },
+    "south": null,
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "layer1": null,
+      "layer2": null,
+      "layer3": null,
+      "layer4": null,
+      "layer5": null,
+      "texture": "rocks/deep_granite"
+    },
+    "west": null
+  },
+  "fluid": null,
+  "format_version": 2,
+  "glass": {
+    "opacity": 0.15000000596046448,
+    "tint_color": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "id": "deep_granite",
+  "inventory_tab": null,
+  "is_water": false,
+  "material": {
+    "albedo": [
+      0.6000000238418579,
+      0.3799999952316284,
+      0.3799999952316284
+    ],
+    "ao": 1.0,
+    "metalness": 0.10000000149011612,
+    "roughness": 0.8999999761581421
+  },
+  "model": null,
+  "model_textures": {},
+  "placement_mode": "fixed",
+  "solid": true,
+  "texture": null,
+  "transparent": false,
+  "volumetric": {
+    "halo_enabled": false,
+    "halo_intensity": 0.6000000238418579,
+    "halo_radius": 2.5,
+    "ray_count": 4,
+    "ray_enabled": false,
+    "ray_falloff": 2.0,
+    "ray_intensity": 0.18000000715255737,
+    "ray_length": 6.0,
+    "ray_width": 0.4000000059604645
+  }
+}

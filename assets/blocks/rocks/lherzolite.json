@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "lherzolite",
+  "display_name": "Lherzolite",
+  "description": "Base lherzolite stone. Found throughout the mantle micro-region.",
+  "color": [
+    0.47,
+    0.56,
+    0.33
+  ],
+  "material": {
+    "albedo": [
+      0.44,
+      0.54,
+      0.36
+    ],
+    "roughness": 0.89,
+    "metalness": 0.05,
+    "ao": 0.96
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/lherzolite"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/lherzolite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/lherzolite"
+    }
+  }
+}

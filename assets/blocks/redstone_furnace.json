@@ -1,0 +1,29 @@
+{
+    "id": "redstone_furnace",
+    "display_name": "Redstone Furnace",
+    "description": "A redstone-powered furnace with custom Java Edition model (multi-texture)",
+    "color": [
+        0.6,
+        0.3,
+        0.3
+    ],
+    "solid": true,
+    "transparent": false,
+    "inventory_tab": "Machines",
+    "placement_mode": "look_horizontal",
+    "model": "redstone_furnace_je.json",
+    "model_textures": {
+        "0": "blue_metal.png",
+        "1": "d_red_metal.png",
+        "2": "ddsmooth_stone2.png"
+    },
+    "material": {
+        "color": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "roughness": 0.7,
+        "metalness": 0.3
+    }
+}

@@ -1,0 +1,57 @@
+{
+  "format_version": 2,
+  "id": "water",
+  "display_name": "Water",
+  "description": "Flowing water block. Transparent and non-solid with variable height.",
+  "color": [
+    0.14,
+    0.32,
+    0.66
+  ],
+  "material": {
+    "albedo": [
+      0.16,
+      0.32,
+      0.67
+    ],
+    "roughness": 0.1,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": false,
+  "transparent": true,
+  "is_water": true,
+  "inventory_tab": "Fluids",
+  "fluid": {
+    "flow_rate": 0.25,
+    "gravity_rate": 1.0,
+    "spread_distance": 7,
+    "fog_color": [
+      0.05,
+      0.2,
+      0.45
+    ],
+    "fog_density": 0.04
+  },
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "common/water"
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "basalt",
+  "display_name": "Basalt",
+  "description": "Base basalt stone. Found throughout the igneous micro-region.",
+  "color": [
+    0.26,
+    0.23,
+    0.18
+  ],
+  "material": {
+    "albedo": [
+      0.25,
+      0.22,
+      0.2
+    ],
+    "roughness": 0.7,
+    "metalness": 0.05,
+    "ao": 0.92
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/basalt"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/basalt"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "rocks/basalt"
+    }
+  }
+}

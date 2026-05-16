@@ -1,0 +1,60 @@
+{
+  "format_version": 2,
+  "id": "dirt_granite",
+  "display_name": "Granite Dirt",
+  "description": "Standard dirt layer beneath granite grass.",
+  "color": [
+    0.51,
+    0.4,
+    0.3
+  ],
+  "material": {
+    "albedo": [
+      0.5,
+      0.41,
+      0.29
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_granite"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_granite"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "dirt/dirt_granite"
+    }
+  }
+}

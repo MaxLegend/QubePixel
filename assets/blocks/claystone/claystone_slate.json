@@ -1,0 +1,44 @@
+{
+  "format_version": 2,
+  "id": "claystone_shale",
+  "display_name": "Hard Shale Clay",
+  "description": "Hardened clay layer compressed from shale sediment.",
+  "color": [
+    0.39,
+    0.35,
+    0.31
+  ],
+  "material": {
+    "albedo": [
+      0.37,
+      0.36,
+      0.33
+    ],
+    "roughness": 0.8,
+    "metalness": 0.05,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "faces": {
+    "all": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "claystone/claystone_slate"
+    }
+  }
+}

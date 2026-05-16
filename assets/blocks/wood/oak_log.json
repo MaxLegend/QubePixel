@@ -1,0 +1,61 @@
+{
+  "format_version": 2,
+  "id": "wood/oak_log",
+  "display_name": "Oak Log",
+  "description": "A round oak log. Rotates based on how you place it.",
+  "color": [
+    0.45,
+    0.30,
+    0.15
+  ],
+  "material": {
+    "albedo": [
+      0.45,
+      0.30,
+      0.15
+    ],
+    "roughness": 0.95,
+    "metalness": 0.0,
+    "ao": 1.0
+  },
+  "solid": true,
+  "transparent": false,
+  "emit_light": 0,
+  "emission": {
+    "emit_light": false,
+    "light_color": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "light_strength": 0.0,
+    "light_intensity": 0.0
+  },
+  "placement_mode": "look_axis",
+  "faces": {
+    "top": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "wood/oak_log_top"
+    },
+    "bottom": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "wood/oak_log_top"
+    },
+    "sides": {
+      "color": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "texture": "wood/oak_log"
+    }
+  }
+}
