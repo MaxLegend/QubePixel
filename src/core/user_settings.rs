@@ -17,8 +17,10 @@ pub struct UserSettings {
     pub biome_ambient_tint_enabled: bool,
     pub shadow_sun_enabled:        bool,
     pub shadow_block_enabled:      bool,
-    pub gi_enabled:                bool,
+    pub gi_mode:                   u32,
     pub shadow_quality:            u32,
+    pub halo_enabled:              bool,
+    pub volumetric_rays_enabled:   bool,
 }
 
 impl Default for UserSettings {
@@ -31,8 +33,10 @@ impl Default for UserSettings {
             biome_ambient_tint_enabled: true,
             shadow_sun_enabled:        true,
             shadow_block_enabled:      true,
-            gi_enabled:                true,
+            gi_mode:                   4,
             shadow_quality:            64,
+            halo_enabled:              true,
+            volumetric_rays_enabled:   true,
         }
     }
 }
@@ -50,7 +54,7 @@ pub fn load_and_apply() {
 
     debug_log!(
         "UserSettings", "load_and_apply",
-        "Loaded: rd={} lod={} vb={} va={} tint={} sun={} block={} gi={} sq={}",
+        "Loaded: rd={} lod={} vb={} va={} tint={} sun={} block={} gi_mode={} sq={}",
         settings.render_distance,
         settings.lod_multiplier_x100,
         settings.vertical_below,
@@ -58,7 +62,7 @@ pub fn load_and_apply() {
         settings.biome_ambient_tint_enabled,
         settings.shadow_sun_enabled,
         settings.shadow_block_enabled,
-        settings.gi_enabled,
+        settings.gi_mode,
         settings.shadow_quality,
     );
 
@@ -69,8 +73,10 @@ pub fn load_and_apply() {
     config::set_biome_ambient_tint_enabled(settings.biome_ambient_tint_enabled);
     config::set_shadow_sun_enabled(settings.shadow_sun_enabled);
     config::set_shadow_block_enabled(settings.shadow_block_enabled);
-    config::set_gi_enabled(settings.gi_enabled);
+    config::set_gi_mode(settings.gi_mode);
     config::set_shadow_quality(settings.shadow_quality);
+    config::set_halo_enabled(settings.halo_enabled);
+    config::set_volumetric_rays_enabled(settings.volumetric_rays_enabled);
 }
 
 /// Read current atomics and write them to the JSON file.
@@ -83,8 +89,10 @@ pub fn save_current() {
         biome_ambient_tint_enabled: config::biome_ambient_tint_enabled(),
         shadow_sun_enabled:        config::shadow_sun_enabled(),
         shadow_block_enabled:      config::shadow_block_enabled(),
-        gi_enabled:                config::gi_enabled(),
+        gi_mode:                   config::gi_mode(),
         shadow_quality:            config::shadow_quality(),
+        halo_enabled:              config::halo_enabled(),
+        volumetric_rays_enabled:   config::volumetric_rays_enabled(),
     };
 
     match serde_json::to_string_pretty(&settings) {

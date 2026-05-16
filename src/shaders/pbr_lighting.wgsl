@@ -374,12 +374,15 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     var lo = vec3<f32>(0.0);
 
+    let sun_shadow_on = u.shadow_params.x > 0.5;
+
     // --- Sun light ---
     let sun_intensity = u.sun_direction.w;
     if (sun_intensity > 0.001) {
         let sun_L        = normalize(u.sun_direction.xyz);
         let sun_radiance = u.sun_color.rgb * sun_intensity;
-        let shadow       = voxel_shadow(input.v_world_pos + N_geom * 0.01, sun_L);
+        var shadow = vec3<f32>(1.0);
+        if (sun_shadow_on) { shadow = voxel_shadow(input.v_world_pos + N_geom * 0.01, sun_L); }
         lo += compute_pbr_light(N, V, sun_L, sun_radiance * shadow, albedo, f0, roughness, metalness);
     }
 
@@ -388,15 +391,16 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (moon_intensity > 0.001) {
         let moon_L        = normalize(u.moon_direction.xyz);
         let moon_radiance = u.moon_color.rgb * moon_intensity;
-        let shadow       = voxel_shadow(input.v_world_pos + N_geom * 0.01, moon_L);
+        var shadow = vec3<f32>(1.0);
+        if (sun_shadow_on) { shadow = voxel_shadow(input.v_world_pos + N_geom * 0.01, moon_L); }
         lo += compute_pbr_light(N, V, moon_L, moon_radiance * shadow, albedo, f0, roughness, metalness);
     }
 
     // --- Emission ---
+    // Multiplied by albedo so texture detail is preserved (same fix as pbr_vct.wgsl).
     let raw_intensity = input.v_emission.w;
     let display_intensity = min(abs(raw_intensity), 0.8);
-    let em_lum = dot(input.v_emission.rgb, vec3<f32>(0.299, 0.587, 0.114));
-    let emission = mix(input.v_emission.rgb, vec3<f32>(em_lum), 0.45) * display_intensity;
+    let emission = input.v_emission.rgb * albedo * display_intensity;
 
     // --- Ambient ---
     let ambient = u.ambient_color.rgb * albedo * vertex_ao * 0.15;

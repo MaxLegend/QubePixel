@@ -7,7 +7,7 @@
 // For air voxels: writes zero (will be filled by propagation).
 
 struct InjectParams {
-    volume_size: vec4<u32>,     // x = side length (128), yzw = 0
+    volume_size: vec4<u32>,  // x = side length (128), y = mono_mode (0=RGB, 1=mono), zw = 0
     _pad: vec4<f32>,
 };
 
@@ -31,7 +31,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Multiplier kept low (2.0) because max-based propagation preserves energy
         // without the 1/r² averaging penalty.  CPU-side pack_volume encodes
         // alpha = intensity * (light_range / MAX_LIGHT_RANGE), so brighter = farther range.
-        textureStore(radiance_out, pos, vec4<f32>(em.rgb * intensity * 2.0, 1.0));
+        var color = em.rgb * intensity * 2.0;
+        if (params.volume_size.y != 0u) {
+            // Mono mode: collapse to luminance so only a single channel carries energy.
+            let lum = dot(color, vec3<f32>(0.299, 0.587, 0.114));
+            color = vec3<f32>(lum, lum, lum);
+        }
+        textureStore(radiance_out, pos, vec4<f32>(color, 1.0));
     } else {
         // Non-emissive or air: zero radiance
         textureStore(radiance_out, pos, vec4<f32>(0.0, 0.0, 0.0, 0.0));

@@ -1370,7 +1370,7 @@ impl Screen for GameScreen {
         self.last_vct_upload_us = t_vct_upload.elapsed().as_micros();
 
         let t_vct_dispatch = Instant::now();
-        vct.dispatch_gi(encoder);
+        vct.dispatch_gi(encoder, queue);
         self.last_vct_dispatch_us = t_vct_dispatch.elapsed().as_micros();
 
         // Build per-frame point light list:

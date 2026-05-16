@@ -21,14 +21,18 @@ use crate::debug_log;
 /// Maximum number of entity AABBs cast into the shadow ray test (e.g. player, mobs).
 const MAX_ENTITY_AABBS: usize = 32;
 
-/// Number of flood-fill propagation iterations per frame.
-/// 64 steps = light travels up to 64 blocks from emissive sources.
-/// Must be >= MAX_LIGHT_RANGE (voxel_volume.rs) for full-range propagation.
-const PROPAGATION_STEPS: u32 = 64;
+/// Propagation step counts per GI mode (indexed by GI_MODE value).
+/// All counts are even so (steps-1) is odd and the last ping-pong write lands in radiance_a
+/// (which is what the pre-built frag_bg binds at binding 2).
+///   Mode 0 = Off    — unused (dispatch skipped)
+///   Mode 1 = Mono16 — 16 steps  (~16 block radius, monochromatic)
+///   Mode 2 = Mono32 — 32 steps  (~32 block radius, monochromatic)
+///   Mode 3 = RGB32  — 32 steps  (~32 block radius, full colour)
+///   Mode 4 = Full   — 64 steps  (~64 block radius, full colour)
+const PROPAGATION_STEPS_BY_MODE: [u32; 5] = [0, 16, 32, 32, 64];
 
 /// Light decay per propagation step (0..1). Higher = light travels farther.
 /// With max-based propagation: 0.97 → after 64 steps = 14% initial brightness.
-/// For glowstone (intensity=1, range=128): visible at 64 blocks ≈ 0.35 post-ACES.
 const PROPAGATION_DECAY: f32 = 0.97;
 
 /// Max voxel shadow ray-march steps (sent to fragment shader).
@@ -125,6 +129,8 @@ pub struct VCTSystem {
     // Current volume state
     volume_origin: [f32; 3],
     volume_uploaded: bool,
+    /// Tracks last applied GI mode so uniform buffers are only rewritten on change.
+    last_gi_mode: u32,
 }
 
 impl VCTSystem {
@@ -632,6 +638,7 @@ impl VCTSystem {
             entity_aabb_buf,
             volume_origin: [0.0; 3],
             volume_uploaded: false,
+            last_gi_mode: u32::MAX, // force UB write on first dispatch
         }
     }
 
@@ -718,13 +725,33 @@ impl VCTSystem {
     // Dispatch GI compute passes (inject + propagate)
     // -----------------------------------------------------------------------
 
-    pub fn dispatch_gi(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn dispatch_gi(&mut self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue) {
         if !self.volume_uploaded {
             return;
         }
-        if !crate::core::config::gi_enabled() {
+        let gi_mode = crate::core::config::gi_mode();
+        if gi_mode == 0 {
             return;
         }
+
+        // Rewrite compute uniform buffers only when the mode changes (typically once per session).
+        if gi_mode != self.last_gi_mode {
+            let mono = if gi_mode == 1 || gi_mode == 2 { 1u32 } else { 0u32 };
+            queue.write_buffer(&self.inject_ub, 0, bytemuck::bytes_of(&InjectParams {
+                volume_size: [VOLUME_SIZE, mono, 0, 0],
+                _pad: [0.0; 4],
+            }));
+            queue.write_buffer(&self.propagate_ub, 0, bytemuck::bytes_of(&PropagateParams {
+                volume_size: [VOLUME_SIZE, 0, 0, 0],
+                config: [PROPAGATION_DECAY, mono as f32, 0.0, 0.0],
+            }));
+            self.last_gi_mode = gi_mode;
+            debug_log!("VCTSystem", "dispatch_gi",
+                "GI mode changed to {} (mono={}, steps={})",
+                gi_mode, mono, PROPAGATION_STEPS_BY_MODE[gi_mode as usize]);
+        }
+
+        let steps = PROPAGATION_STEPS_BY_MODE[gi_mode as usize];
 
         // workgroup_size(8, 8, 4): XY groups = ceil(128/8)=16, Z groups = ceil(128/4)=32
         let groups_xy = (VOLUME_SIZE + 7) / 8;
@@ -740,7 +767,7 @@ impl VCTSystem {
             pass.dispatch_workgroups(groups_xy, groups_xy, groups_z);
         }
 
-        for step in 0..PROPAGATION_STEPS {
+        for step in 0..steps {
             let bg = if step % 2 == 0 { &self.propagate_bg_ab } else { &self.propagate_bg_ba };
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("VCT Propagate"),

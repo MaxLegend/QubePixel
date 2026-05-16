@@ -11,16 +11,15 @@
   "emission": {
     "emit_light": true,
     "light_color": [
+      0.0,
       1.0,
-      0.8500000238418579,
-      0.30000001192092896
+      0.0
     ],
     "light_intensity": 0.5,
-    "light_range": 128.0,
-    "light_strength": 0.5,
+    "light_range": 10.0,
+    "light_strength": 3.0,
     "no_self_gi": true
   },
-  "emit_light": 25,
   "faces": {
     "all": null,
     "bottom": {
@@ -79,7 +78,30 @@
   },
   "id": "glowstone",
   "inventory_tab": "Lighting2",
-  "is_water": false,
+  "light_sources": [
+    {
+      "color": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "direction": [
+        0.0,
+        -1.0,
+        0.0
+      ],
+      "focus": 30.0,
+      "intensity": 8.0,
+      "kind": "point",
+      "label": "main",
+      "position": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "range": 16.0
+    }
+  ],
   "material": {
     "albedo": [
       1.0,

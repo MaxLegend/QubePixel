@@ -220,21 +220,32 @@ impl Screen for SettingsScreen {
                     );
                     ui.add_space(8.0);
 
-                    let mut gi_on = config::gi_enabled();
-                    if ui.checkbox(&mut gi_on, "Enable VCT GI").changed() {
-                        config::set_gi_enabled(gi_on);
+                    let mut gi_mode = config::gi_mode();
+                    let prev_gi_mode = gi_mode;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut gi_mode, 0u32, "Off");
+                        ui.selectable_value(&mut gi_mode, 1u32, "Mono 16");
+                        ui.selectable_value(&mut gi_mode, 2u32, "Mono 32");
+                        ui.selectable_value(&mut gi_mode, 3u32, "RGB 32");
+                        ui.selectable_value(&mut gi_mode, 4u32, "Full");
+                    });
+                    if gi_mode != prev_gi_mode {
+                        config::set_gi_mode(gi_mode);
                         user_settings::save_current();
-                        debug_log!("SettingsScreen", "build_ui", "GI enabled -> {}", gi_on);
+                        debug_log!("SettingsScreen", "build_ui", "GI mode -> {}", gi_mode);
                     }
                     ui.add_space(4.0);
+                    let gi_desc = match gi_mode {
+                        0 => "GI off — highest FPS. Block lights still cast DDA shadows.",
+                        1 => "Mono 16 — 16-step monochromatic flood-fill, ~16 block radius. Minecraft-style.",
+                        2 => "Mono 32 — 32-step monochromatic flood-fill, ~32 block radius.",
+                        3 => "RGB 32 — 32-step coloured flood-fill, ~32 block radius.",
+                        _ => "Full — 64-step coloured flood-fill, ~64 block radius. Maximum quality.",
+                    };
                     ui.label(
-                        egui::RichText::new(
-                            "Voxel Cone Tracing — flood-fills block light \
-                             up to 64 blocks. Disabling gives the largest \
-                             GPU performance boost."
-                        )
-                        .size(11.0)
-                        .color(egui::Color32::GRAY),
+                        egui::RichText::new(gi_desc)
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
                     );
 
                     ui.add_space(16.0);
@@ -286,6 +297,51 @@ impl Screen for SettingsScreen {
                         .color(egui::Color32::GRAY),
                     );
 
+                    ui.add_space(12.0);
+
+                    // --- Volumetric effects ---
+                    ui.label(
+                        egui::RichText::new("Volumetric Effects")
+                            .size(16.0)
+                            .strong()
+                            .color(egui::Color32::LIGHT_GRAY),
+                    );
+                    ui.add_space(6.0);
+
+                    let mut halo_on = config::halo_enabled();
+                    if ui.checkbox(&mut halo_on, "Light halos").changed() {
+                        config::set_halo_enabled(halo_on);
+                        user_settings::save_current();
+                        debug_log!("SettingsScreen", "build_ui", "Halo -> {}", halo_on);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Billboard glow quads around point and spot lights."
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                    );
+
+                    ui.add_space(8.0);
+
+                    let mut rays_on = config::volumetric_rays_enabled();
+                    if ui.checkbox(&mut rays_on, "Volumetric god rays").changed() {
+                        config::set_volumetric_rays_enabled(rays_on);
+                        user_settings::save_current();
+                        debug_log!("SettingsScreen", "build_ui", "Volumetric rays -> {}", rays_on);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Beam quads emitted by spot lights (spotlights, etc.)."
+                        )
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                    );
+
+                    ui.add_space(12.0);
+                    ui.separator();
                     ui.add_space(12.0);
 
                     // --- Shadow Quality (DDA step count) ---

@@ -670,9 +670,10 @@ fn eval_point_light(
 
     // Voxel shadow toward the light source (respects block shadow toggle).
     // Returns per-channel transmission so coloured glass tints point lights.
-    let shadow = select(vec3<f32>(1.0),
-                        voxel_shadow_to_point(world_pos, light.pos_range.xyz, light.source_voxel),
-                        u.shadow_params.y > 0.5);
+    var shadow = vec3<f32>(1.0);
+    if (u.shadow_params.y > 0.5) {
+        shadow = voxel_shadow_to_point(world_pos, light.pos_range.xyz, light.source_voxel);
+    }
 
     return compute_pbr_light(N, V, L, radiance * shadow, albedo, f0, roughness, metalness);
 }
@@ -712,9 +713,10 @@ fn eval_spot_light(
     let radiance = light.color_intensity.rgb * light.color_intensity.w * attenuation;
 
     // Voxel shadow toward the light source (respects block shadow toggle).
-    let shadow = select(vec3<f32>(1.0),
-                        voxel_shadow_to_point(world_pos, light.pos_range.xyz, vec4<i32>(0, 0, 0, 0)),
-                        u.shadow_params.y > 0.5);
+    var shadow = vec3<f32>(1.0);
+    if (u.shadow_params.y > 0.5) {
+        shadow = voxel_shadow_to_point(world_pos, light.pos_range.xyz, vec4<i32>(0, 0, 0, 0));
+    }
 
     return compute_pbr_light(N, V, L, radiance * shadow, albedo, f0, roughness, metalness);
 }
@@ -786,7 +788,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (sun_intensity > 0.001) {
         let sun_L        = normalize(u.sun_direction.xyz);
         let sun_radiance = u.sun_color.rgb * sun_intensity;
-        let sun_shadow   = select(vec3<f32>(1.0), voxel_shadow_directional(shadow_origin, sun_L), sun_shadow_on);
+        var sun_shadow = vec3<f32>(1.0);
+        if (sun_shadow_on) { sun_shadow = voxel_shadow_directional(shadow_origin, sun_L); }
         lo += compute_pbr_light(N, V, sun_L, sun_radiance * sun_shadow, albedo, f0, roughness, metalness);
     }
 
@@ -797,7 +800,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (moon_intensity > 0.001) {
         let moon_L        = normalize(u.moon_direction.xyz);
         let moon_radiance = u.moon_color.rgb * moon_intensity;
-        let moon_shadow   = select(vec3<f32>(1.0), voxel_shadow_directional(shadow_origin, moon_L), sun_shadow_on);
+        var moon_shadow = vec3<f32>(1.0);
+        if (sun_shadow_on) { moon_shadow = voxel_shadow_directional(shadow_origin, moon_L); }
         lo += compute_pbr_light(N, V, moon_L, moon_radiance * moon_shadow, albedo, f0, roughness, metalness);
     }
 
@@ -829,10 +833,12 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // ===========================================
-    // 6. Self-emission (HDR вЂ” ACES handles range)
+    // 6. Self-emission (HDR — ACES handles range)
     // ===========================================
+    // Multiplied by albedo so texture detail is preserved — bright texture spots
+    // glow brighter, dark crevices stay dark instead of a uniform colour overlay.
     let raw_intensity = input.v_emission.w;
-    let emission = input.v_emission.rgb * abs(raw_intensity) * 1.0;
+    let emission = input.v_emission.rgb * albedo * abs(raw_intensity);
 
     // ===========================================
     // 7. Ambient (minimum base light everywhere)

@@ -277,50 +277,57 @@ impl VolumetricRenderer {
         point_lights: &[PointLightGPU],
         spot_lights:  &[SpotLightGPU],
     ) {
+        let halo_on = crate::core::config::halo_enabled();
+        let rays_on = crate::core::config::volumetric_rays_enabled();
+
         // -- Build halo instance list --
         let mut halos: Vec<HaloInstance> = Vec::new();
 
-        for pl in point_lights {
-            if halos.len() >= self.max_halos { break; }
-            let range     = pl.pos_range[3];
-            let intensity = pl.color_intensity[3];
-            let halo_r    = (range * 0.18).clamp(0.5, 6.0);
-            let halo_i    = (intensity * 0.05).clamp(0.0, 0.75);
-            halos.push(HaloInstance {
-                world_pos_radius: [pl.pos_range[0], pl.pos_range[1], pl.pos_range[2], halo_r],
-                color_intensity:  [pl.color_intensity[0], pl.color_intensity[1], pl.color_intensity[2], halo_i],
-            });
-        }
+        if halo_on {
+            for pl in point_lights {
+                if halos.len() >= self.max_halos { break; }
+                let range     = pl.pos_range[3];
+                let intensity = pl.color_intensity[3];
+                let halo_r    = (range * 0.18).clamp(0.5, 6.0);
+                let halo_i    = (intensity * 0.05).clamp(0.0, 0.75);
+                halos.push(HaloInstance {
+                    world_pos_radius: [pl.pos_range[0], pl.pos_range[1], pl.pos_range[2], halo_r],
+                    color_intensity:  [pl.color_intensity[0], pl.color_intensity[1], pl.color_intensity[2], halo_i],
+                });
+            }
 
-        for sl in spot_lights {
-            if halos.len() >= self.max_halos { break; }
-            let range     = sl.pos_range[3];
-            let intensity = sl.color_intensity[3];
-            let halo_r    = (range * 0.12).clamp(0.4, 4.0);
-            let halo_i    = (intensity * 0.04).clamp(0.0, 0.6);
-            halos.push(HaloInstance {
-                world_pos_radius: [sl.pos_range[0], sl.pos_range[1], sl.pos_range[2], halo_r],
-                color_intensity:  [sl.color_intensity[0], sl.color_intensity[1], sl.color_intensity[2], halo_i],
-            });
+            for sl in spot_lights {
+                if halos.len() >= self.max_halos { break; }
+                let range     = sl.pos_range[3];
+                let intensity = sl.color_intensity[3];
+                let halo_r    = (range * 0.12).clamp(0.4, 4.0);
+                let halo_i    = (intensity * 0.04).clamp(0.0, 0.6);
+                halos.push(HaloInstance {
+                    world_pos_radius: [sl.pos_range[0], sl.pos_range[1], sl.pos_range[2], halo_r],
+                    color_intensity:  [sl.color_intensity[0], sl.color_intensity[1], sl.color_intensity[2], halo_i],
+                });
+            }
         }
 
         // -- Build ray instance list (spot lights → directional god rays) --
         let mut rays: Vec<RayInstance> = Vec::new();
 
-        for (i, sl) in spot_lights.iter().enumerate() {
-            if rays.len() >= self.max_rays { break; }
-            let dir       = Vec3::new(sl.dir_inner[0], sl.dir_inner[1], sl.dir_inner[2]);
-            let range     = sl.pos_range[3];
-            let intensity = sl.color_intensity[3];
-            let ray_len   = range.min(12.0);
-            let ray_width = (range * 0.04).clamp(0.2, 1.5);
-            let ray_i     = (intensity * 0.03).clamp(0.0, 0.5);
-            rays.push(RayInstance {
-                origin_len:   [sl.pos_range[0], sl.pos_range[1], sl.pos_range[2], ray_len],
-                dir_width:    [dir.x, dir.y, dir.z, ray_width],
-                color_int:    [sl.color_intensity[0], sl.color_intensity[1], sl.color_intensity[2], ray_i],
-                falloff_time: [2.0, i as f32 * 1.3, 0.0, 0.0],
-            });
+        if rays_on {
+            for (i, sl) in spot_lights.iter().enumerate() {
+                if rays.len() >= self.max_rays { break; }
+                let dir       = Vec3::new(sl.dir_inner[0], sl.dir_inner[1], sl.dir_inner[2]);
+                let range     = sl.pos_range[3];
+                let intensity = sl.color_intensity[3];
+                let ray_len   = range.min(12.0);
+                let ray_width = (range * 0.04).clamp(0.2, 1.5);
+                let ray_i     = (intensity * 0.03).clamp(0.0, 0.5);
+                rays.push(RayInstance {
+                    origin_len:   [sl.pos_range[0], sl.pos_range[1], sl.pos_range[2], ray_len],
+                    dir_width:    [dir.x, dir.y, dir.z, ray_width],
+                    color_int:    [sl.color_intensity[0], sl.color_intensity[1], sl.color_intensity[2], ray_i],
+                    falloff_time: [2.0, i as f32 * 1.3, 0.0, 0.0],
+                });
+            }
         }
 
         let halo_count = halos.len() as u32;

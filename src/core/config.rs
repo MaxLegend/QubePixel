@@ -82,12 +82,22 @@ pub static SHADOW_SUN_ENABLED: AtomicU32 = AtomicU32::new(1);
 /// Whether voxel DDA shadow from block light sources (point/spot lights) is applied. 1 = enabled (default).
 pub static SHADOW_BLOCK_ENABLED: AtomicU32 = AtomicU32::new(1);
 
-/// Whether VCT global illumination is dispatched each frame. 1 = enabled (default).
-/// Disabling skips the inject + 64 propagation compute passes — large GPU savings.
-pub static GI_ENABLED: AtomicU32 = AtomicU32::new(1);
+/// GI quality mode (persisted in user settings).
+/// 0 = Off    — skips all compute passes; ~4× GPU saving.
+/// 1 = Mono16 — 16 propagation steps, monochromatic (Minecraft-style, ~16 block radius).
+/// 2 = Mono32 — 32 propagation steps, monochromatic (~32 block radius).
+/// 3 = RGB32  — 32 propagation steps, full colour (~32 block radius).
+/// 4 = Full   — 64 propagation steps, full colour (~64 block radius, current maximum).
+pub static GI_MODE: AtomicU32 = AtomicU32::new(4);
 
 /// Number of DDA ray-march steps for shadow rays. Valid presets: 8, 16, 32, 64.
 pub static SHADOW_QUALITY: AtomicU32 = AtomicU32::new(64);
+
+/// Whether light halos (billboard glow quads around light sources) are rendered. 1 = enabled.
+pub static HALO_ENABLED: AtomicU32 = AtomicU32::new(1);
+
+/// Whether volumetric god rays (spot-light beam quads) are rendered. 1 = enabled.
+pub static VOLUMETRIC_RAYS_ENABLED: AtomicU32 = AtomicU32::new(1);
 
 // ---------------------------------------------------------------------------
 // Render distance
@@ -165,12 +175,22 @@ pub fn set_shadow_block_enabled(v: bool) {
     SHADOW_BLOCK_ENABLED.store(v as u32, Ordering::Relaxed);
 }
 
+pub fn gi_mode() -> u32 {
+    GI_MODE.load(Ordering::Relaxed).clamp(0, 4)
+}
+
+pub fn set_gi_mode(v: u32) {
+    let clamped = v.clamp(0, 4);
+    GI_MODE.store(clamped, Ordering::Relaxed);
+    debug_log!("Config", "set_gi_mode", "GI mode set to {}", clamped);
+}
+
 pub fn gi_enabled() -> bool {
-    GI_ENABLED.load(Ordering::Relaxed) != 0
+    gi_mode() != 0
 }
 
 pub fn set_gi_enabled(v: bool) {
-    GI_ENABLED.store(v as u32, Ordering::Relaxed);
+    set_gi_mode(if v { 4 } else { 0 });
 }
 
 /// DDA shadow ray-march step count. Clamped to [8, 64].
@@ -180,6 +200,22 @@ pub fn shadow_quality() -> u32 {
 
 pub fn set_shadow_quality(v: u32) {
     SHADOW_QUALITY.store(v.clamp(8, 64), Ordering::Relaxed);
+}
+
+pub fn halo_enabled() -> bool {
+    HALO_ENABLED.load(Ordering::Relaxed) != 0
+}
+
+pub fn set_halo_enabled(v: bool) {
+    HALO_ENABLED.store(v as u32, Ordering::Relaxed);
+}
+
+pub fn volumetric_rays_enabled() -> bool {
+    VOLUMETRIC_RAYS_ENABLED.load(Ordering::Relaxed) != 0
+}
+
+pub fn set_volumetric_rays_enabled(v: bool) {
+    VOLUMETRIC_RAYS_ENABLED.store(v as u32, Ordering::Relaxed);
 }
 
 /// Compute the LOD level for a chunk at the given chunk coordinates.

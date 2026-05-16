@@ -17,7 +17,7 @@
 
 struct PropagateParams {
     volume_size: vec4<u32>,   // x = side length (128)
-    config:      vec4<f32>,   // x = decay (0..1), y = iteration, zw = 0
+    config:      vec4<f32>,   // x = decay (0..1), y = mono_mode (0.0=RGB, 1.0=mono), zw = 0
 };
 
 @group(0) @binding(0) var<uniform> params:       PropagateParams;
@@ -83,10 +83,17 @@ fn main(
     let em      = textureLoad(voxel_emission, pos, 0);
     let is_glass = opacity >= GLASS_ALPHA_MIN && opacity <= GLASS_ALPHA_MAX;
 
+    let mono_mode = params.config.y > 0.5;
+
     // --- Fully opaque solid voxel: keep emission, block propagation ---
     if (opacity > 0.85) {
         if (em.a > 0.001) {
-            textureStore(radiance_out, pos, vec4<f32>(em.rgb * em.a * 2.0, 1.0));
+            var em_color = em.rgb * em.a * 2.0;
+            if (mono_mode) {
+                let lum = dot(em_color, vec3<f32>(0.299, 0.587, 0.114));
+                em_color = vec3<f32>(lum, lum, lum);
+            }
+            textureStore(radiance_out, pos, vec4<f32>(em_color, 1.0));
         } else {
             textureStore(radiance_out, pos, vec4<f32>(0.0, 0.0, 0.0, 1.0));
         }
@@ -96,7 +103,12 @@ fn main(
     // --- Model block: keep emission if bright, but let light propagate ---
     if (opacity > 0.2 && opacity < 0.5) {
         if (em.a > 0.001) {
-            textureStore(radiance_out, pos, vec4<f32>(em.rgb * em.a * 2.0, 1.0));
+            var em_color = em.rgb * em.a * 2.0;
+            if (mono_mode) {
+                let lum = dot(em_color, vec3<f32>(0.299, 0.587, 0.114));
+                em_color = vec3<f32>(lum, lum, lum);
+            }
+            textureStore(radiance_out, pos, vec4<f32>(em_color, 1.0));
         }
     }
 
@@ -125,7 +137,13 @@ fn main(
 
     var result = best * decay;
 
-    // Glass tinting
+    // In mono mode, collapse propagated radiance to luminance.
+    if (mono_mode) {
+        let lum = dot(result, vec3<f32>(0.299, 0.587, 0.114));
+        result = vec3<f32>(lum, lum, lum);
+    }
+
+    // Glass tinting (applied after mono collapse so glass still tints in RGB mode)
     if (is_glass) {
         let tint = textureLoad(voxel_tint, pos, 0);
         let op   = tint.a;

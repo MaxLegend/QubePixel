@@ -826,6 +826,23 @@ impl BlockEditor {
         ui.label(RichText::new("Controls global illumination contribution and VCT flood-fill range.").small().color(Color32::GRAY));
         ui.add_space(4.0);
 
+        let gi_mode = crate::core::config::gi_mode();
+        let is_mono = gi_mode == 1 || gi_mode == 2;
+        let max_range = match gi_mode { 1 => 16.0_f32, 2 | 3 => 32.0, _ => 128.0 };
+
+        if is_mono {
+            ui.label(
+                RichText::new(format!(
+                    "⚠ {} mode active — color editing disabled, range capped to {} blocks.",
+                    if gi_mode == 1 { "Mono 16" } else { "Mono 32" },
+                    max_range as i32,
+                ))
+                .size(11.0)
+                .color(Color32::from_rgb(255, 200, 60)),
+            );
+            ui.add_space(4.0);
+        }
+
         toggle_field(
             ui, &mut self.edit_def.emission.emit_light, "Emit Light",
             "Master switch. When true, this block acts as a light source in the VCT GI system.",
@@ -834,7 +851,10 @@ impl BlockEditor {
 
         if self.edit_def.emission.emit_light {
             labeled_field(ui, "Light Color (RGB)", "Color of emitted light. Pure white = neutral, colored = tinted GI.");
-            if color_edit_3(ui, &mut self.edit_def.emission.light_color) { self.dirty = true; }
+            ui.scope(|ui| {
+                ui.set_enabled(!is_mono);
+                if color_edit_3(ui, &mut self.edit_def.emission.light_color) { self.dirty = true; }
+            });
 
             labeled_field(ui, "Light Strength (0..15)", "Radius of influence: how many blocks the flood-fill propagates.");
             if ui.add(egui::Slider::new(&mut self.edit_def.emission.light_strength, 0.0_f32..=15.0)
@@ -844,8 +864,8 @@ impl BlockEditor {
             if ui.add(egui::Slider::new(&mut self.edit_def.emission.light_intensity, 0.0_f32..=3.0)
                 .text("intensity")).changed() { self.dirty = true; }
 
-            labeled_field(ui, "Light Range (blocks)", "Maximum distance (in blocks) that emitted light can travel (1..128).");
-            if ui.add(egui::Slider::new(&mut self.edit_def.emission.light_range, 1.0_f32..=128.0)
+            labeled_field(ui, "Light Range (blocks)", "Maximum distance (in blocks) that emitted light can travel.");
+            if ui.add(egui::Slider::new(&mut self.edit_def.emission.light_range, 1.0_f32..=max_range)
                 .text("range")).changed() { self.dirty = true; }
 
             toggle_field(
@@ -893,6 +913,23 @@ impl BlockEditor {
              Arrows are drawn in the preview to visualize each source."
         ).small().color(Color32::GRAY));
         ui.add_space(6.0);
+
+        let gi_mode = crate::core::config::gi_mode();
+        let is_mono = gi_mode == 1 || gi_mode == 2;
+        let max_range_point = match gi_mode { 1 => 16.0_f32, 2 | 3 => 32.0, _ => 64.0 };
+
+        if is_mono {
+            ui.label(
+                RichText::new(format!(
+                    "⚠ {} mode active — color editing disabled, range capped to {} blocks.",
+                    if gi_mode == 1 { "Mono 16" } else { "Mono 32" },
+                    max_range_point as i32,
+                ))
+                .size(11.0)
+                .color(Color32::from_rgb(255, 200, 60)),
+            );
+            ui.add_space(4.0);
+        }
 
         ui.horizontal(|ui| {
             if ui.add(egui::Button::new(egui::RichText::new("+ Add Point Light").size(13.0))
@@ -999,7 +1036,10 @@ impl BlockEditor {
                     // Color
                     ui.label(RichText::new("Color").size(11.0).color(Color32::LIGHT_GRAY))
                         .on_hover_text("RGB color of the emitted light (0..1 per channel).");
-                    if color_edit_3(ui, &mut ls.color) { self.dirty = true; }
+                    ui.scope(|ui| {
+                        ui.set_enabled(!is_mono);
+                        if color_edit_3(ui, &mut ls.color) { self.dirty = true; }
+                    });
 
                     // Intensity
                     ui.label(RichText::new("Intensity").size(11.0).color(Color32::LIGHT_GRAY))
@@ -1010,7 +1050,7 @@ impl BlockEditor {
                     if ls.kind == LightKind::Point {
                         ui.label(RichText::new("Range (blocks, 0 = default)").size(11.0).color(Color32::LIGHT_GRAY))
                             .on_hover_text("Maximum distance this light illuminates. 0 uses the global default for the GI system.");
-                        if ui.add(egui::Slider::new(&mut ls.range, 0.0_f32..=64.0).text("range")).changed() { self.dirty = true; }
+                        if ui.add(egui::Slider::new(&mut ls.range, 0.0_f32..=max_range_point).text("range")).changed() { self.dirty = true; }
                     }
 
                     // Direction + Focus (directional only)
